@@ -1,0 +1,39 @@
+{
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "avisos-campo",
+          "appId": "1:89846685828:android:aa02b5ced459a13a5762d1",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "avisos-campo",
+          "configurations": {
+            "android": "1:89846685828:android:aa02b5ced459a13a5762d1",
+            "ios": "1:89846685828:ios:001ae69a6f96b9615762d1",
+            "macos": "1:89846685828:ios:001ae69a6f96b9615762d1",
+            "web": "1:89846685828:web:9b63eb3f8b3baacf5762d1",
+            "windows": "1:89846685828:web:1b833ca5af5808175762d1"
+          }
+        }
+      }
+    }
+  },
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "default",
+      "disallowLegacyRuntimeConfig": true,
+      "ignore": [
+        "node_modules",
+        ".git",
+        "firebase-debug.log",
+        "firebase-debug.*.log",
+        "*.local"
+      ]
+    }
+  ]
+}
