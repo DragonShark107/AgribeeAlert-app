@@ -1,0 +1,100 @@
+rules_version = '2';
+
+// Reglas de seguridad de Firestore para Agribee Alert.
+//
+// Importante: el servidor (servidor_avisos.js / Cloud Function) usa firebase-admin,
+// que NO pasa por estas reglas. Por eso puede leer todas las parcelas y ubicaciones
+// para calcular a quién avisar, mientras que desde la app cada usuario solo ve lo suyo.
+//
+// Para publicarlas:  firebase deploy --only firestore:rules
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function autenticado() {
+      return request.auth != null;
+    }
+
+    function esCoordenada(lat, lng) {
+      return lat is number && lng is number
+        && lat >= -90 && lat <= 90
+        && lng >= -180 && lng <= 180;
+    }
+
+    // ------------------------------------------------------------------
+    // Avisos fitosanitarios: públicos para cualquier usuario con sesión
+    // (se muestran en el mapa), pero solo su creador puede borrarlos.
+    // ------------------------------------------------------------------
+    match /avisos/{avisoId} {
+      allow read: if autenticado();
+
+      allow create: if autenticado()
+        && request.resource.data.creatorUid == request.auth.uid
+        && esCoordenada(request.resource.data.latitud, request.resource.data.longitud)
+        && request.resource.data.radioKm is number
+        && request.resource.data.radioKm > 0
+        && request.resource.data.radioKm <= 30
+        && request.resource.data.tipo is string
+        && request.resource.data.tipo.size() <= 60
+        && request.resource.data.cultivo is string
+        && request.resource.data.cultivo.size() <= 200
+        && request.resource.data.observaciones is string
+        && request.resource.data.observaciones.size() <= 1000
+        && request.resource.data.fecha == request.time
+        && request.resource.data.expiraEn is timestamp;
+
+      // La app no edita avisos; solo el creador puede retirarlos.
+      allow update: if false;
+      allow delete: if autenticado() && resource.data.creatorUid == request.auth.uid;
+    }
+
+    // ------------------------------------------------------------------
+    // Parcelas y colmenas: privadas. Cada usuario solo lee y gestiona las suyas.
+    // ------------------------------------------------------------------
+    match /mis_parcelas/{parcelaId} {
+      allow read, delete: if autenticado() && resource.data.userId == request.auth.uid;
+
+      allow create: if autenticado()
+        && request.resource.data.userId == request.auth.uid
+        && esCoordenada(request.resource.data.latitud, request.resource.data.longitud)
+        && request.resource.data.nombre is string
+        && request.resource.data.nombre.size() > 0
+        && request.resource.data.nombre.size() <= 100
+        && request.resource.data.radioAvisoKm is number
+        && request.resource.data.radioAvisoKm > 0
+        && request.resource.data.radioAvisoKm <= 15;
+
+      // Al editar solo se pueden cambiar nombre, tipo y radio (no el dueño ni la posición).
+      allow update: if autenticado()
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['nombre', 'tipo', 'radioAvisoKm'])
+        && request.resource.data.nombre is string
+        && request.resource.data.nombre.size() > 0
+        && request.resource.data.nombre.size() <= 100
+        && request.resource.data.radioAvisoKm is number
+        && request.resource.data.radioAvisoKm > 0
+        && request.resource.data.radioAvisoKm <= 15;
+    }
+
+    // ------------------------------------------------------------------
+    // Datos del usuario (tokens de notificación y última ubicación):
+    // estrictamente privados, solo el propio usuario.
+    // ------------------------------------------------------------------
+    match /usuarios/{uid} {
+      allow read, delete: if autenticado() && request.auth.uid == uid;
+
+      allow create, update: if autenticado()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['fcmTokens', 'tokenActualizado', 'latitud', 'longitud', 'ubicacionActualizada'])
+        && (!('fcmTokens' in request.resource.data)
+            || (request.resource.data.fcmTokens is list && request.resource.data.fcmTokens.size() <= 10))
+        && (!('latitud' in request.resource.data)
+            || esCoordenada(request.resource.data.latitud, request.resource.data.longitud));
+    }
+
+    // Todo lo demás, denegado.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

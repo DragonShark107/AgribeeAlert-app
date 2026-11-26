@@ -1,17 +1,24 @@
-# avisos_campo
+# Agribee Alert (avisos_campo)
 
-A new Flutter project.
+App Flutter + Firebase que avisa a apicultores, agricultores y vecinos de los tratamientos fitosanitarios cercanos.
 
-## Getting Started
+## Ejecutar la app
 
-This project is a starting point for a Flutter application.
+1. Copia `claves.example.json` a `claves.json` y pon tu clave de Stadia Maps. `claves.json` no se sube a GitHub.
+2. Ejecuta:
 
-A few resources to get you started if this is your first Flutter project:
+   ```
+   flutter pub get
+   flutter run --dart-define-from-file=claves.json
+   ```
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+   En VS Code, F5 ya pasa ese archivo (`.vscode/launch.json`). Sin clave, el mapa oscuro usa CARTO.
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+## Envío de avisos
+
+Los avisos los reparte el servidor, que calcula a quién le pilla cerca. Usa solo una de estas dos opciones:
+
+- `node servidor_avisos.js`, que necesita `serviceAccountKey.json`. Ese archivo no se sube nunca.
+- La Cloud Function de `functions/`, que necesita el plan Blaze: `firebase deploy --only functions`.
+
+Las reglas de seguridad están en `firestore.rules`.

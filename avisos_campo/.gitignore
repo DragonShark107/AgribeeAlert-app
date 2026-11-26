@@ -50,3 +50,12 @@ app.*.map.json
 # Firebase & Node local
 serviceAccountKey.json
 node_modules/
+
+# Claves privadas (copiar claves.example.json a claves.json)
+claves.json
+
+# Configuración local de Claude Code
+.claude/
+
+# Informes generados por Gradle
+/android/build/

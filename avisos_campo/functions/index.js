@@ -1,30 +1,28 @@
-const functions = require("firebase-functions");
-const admin = require("firebase-admin");
-admin.initializeApp();
+// Cloud Function: avisa a los usuarios cercanos cuando se crea un aviso.
+// Hace lo mismo que servidor_avisos.js. Usa solo UNA de las dos opciones:
+// si están las dos en marcha a la vez, cada aviso se envía dos veces.
+const { onDocumentCreated } = require("firebase-functions/v2/firestore");
+const { initializeApp } = require("firebase-admin/app");
+const { getFirestore, FieldValue } = require("firebase-admin/firestore");
+const { getMessaging } = require("firebase-admin/messaging");
+const { notificarAviso } = require("./notificar");
 
-exports.notificarNuevoAviso = functions.firestore
-  .document("avisos/{avisoId}")
-  .onCreate(async (snap, context) => {
-    const data = snap.data();
-    const tipo = data.tipo || "Tratamiento";
-    const localidad = data.localidad || "tu zona";
+initializeApp();
 
-    const message = {
-      topic: "avisos_generales",
-      notification: {
-        title: "⚡ ALERTA FITOSANITARIA",
-        body: `Nuevo tratamiento de ${tipo} en ${localidad}.`,
-      },
-      data: {
-        lat: String(data.latitud),
-        lng: String(data.longitud),
-      },
-    };
+exports.notificarNuevoAviso = onDocumentCreated("avisos/{avisoId}", async (event) => {
+  const snap = event.data;
+  if (!snap) return;
 
-    try {
-      await admin.messaging().send(message);
-      console.log("Notificación push enviada con éxito.");
-    } catch (error) {
-      console.error("Error enviando push:", error);
-    }
-  });
+  try {
+    const r = await notificarAviso({
+      db: getFirestore(),
+      messaging: getMessaging(),
+      FieldValue,
+      avisoId: event.params.avisoId,
+      aviso: snap.data(),
+    });
+    console.log(`Aviso ${event.params.avisoId}: ${r.usuarios} usuarios afectados, ${r.enviados} enviados, ${r.fallidos} fallidos.`);
+  } catch (error) {
+    console.error("Error enviando aviso:", error);
+  }
+});

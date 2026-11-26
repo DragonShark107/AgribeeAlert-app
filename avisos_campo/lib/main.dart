@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ui';
+import 'package:flutter/foundation.dart' show kIsWeb, defaultTargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
@@ -25,6 +26,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 late String kUserIdActual;
 
+/// Clave de Stadia Maps, leída de claves.json al compilar (ese archivo no se sube a GitHub).
+const String kStadiaApiKey = String.fromEnvironment('STADIA_API_KEY');
+
 final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
     FlutterLocalNotificationsPlugin();
 
@@ -37,121 +41,128 @@ const AndroidNotificationChannel canalNotificaciones = AndroidNotificationChanne
 
 final ValueNotifier<LatLng?> ubicacionNotificacionSeleccionada = ValueNotifier<LatLng?>(null);
 
+// Los avisos ahora los filtra el SERVIDOR (functions/notificar.js) y llegan
+// como notificación normal y visible solo a quien está cerca. Android e iOS
+// la muestran por sí solos con la app en segundo plano o cerrada, así que este
+// handler no tiene que hacer nada, pero debe existir para Android.
+// (Antes se mandaba un mensaje silencioso a todos y cada móvil decidía; en
+// iPhone esos mensajes se retrasan o se pierden.)
 @pragma('vm:entry-point')
-Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
-  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
-
-  final data = message.data;
-  if (data.isEmpty) return;
-
-  // 1. Evitar auto-notificarte si tú creaste el aviso
-  final currentUser = FirebaseAuth.instance.currentUser;
-  if (currentUser != null && data['creatorUid'] == currentUser.uid) return;
-
-  final double avisoLat = double.tryParse(data['lat']?.toString() ?? '0') ?? 0;
-  final double avisoLng = double.tryParse(data['lng']?.toString() ?? '0') ?? 0;
-  final double avisoRadioKm = double.tryParse(data['radioKm']?.toString() ?? '1') ?? 1.0;
-
-  bool debeNotificar = false;
-  String motivoAviso = '';
-
-  // 2. Comprobar si estás dentro del radio por GPS
-  try {
-    if (await Geolocator.isLocationServiceEnabled()) {
-      Position? pos = await Geolocator.getLastKnownPosition();
-      if (pos != null) {
-        double dist = Geolocator.distanceBetween(pos.latitude, pos.longitude, avisoLat, avisoLng);
-        if (dist <= avisoRadioKm * 1000) {
-          debeNotificar = true;
-          motivoAviso = 'cerca de tu posición';
-        }
-      }
-    }
-  } catch (_) {}
-
-  // 3. Comprobar si intersecta alguna de tus parcelas
-  if (!debeNotificar && currentUser != null) {
-    try {
-      final parcelas = await FirebaseFirestore.instance
-          .collection('mis_parcelas')
-          .where('userId', isEqualTo: currentUser.uid)
-          .get();
-
-      for (var doc in parcelas.docs) {
-        final p = doc.data();
-        final double pLat = (p['latitud'] as num).toDouble();
-        final double pLng = (p['longitud'] as num).toDouble();
-        final double pRadioKm = (p['radioAvisoKm'] as num?)?.toDouble() ?? 2.0;
-
-        final dist = Geolocator.distanceBetween(pLat, pLng, avisoLat, avisoLng);
-        if (dist <= (avisoRadioKm + pRadioKm) * 1000) {
-          debeNotificar = true;
-          motivoAviso = 'cerca de tu parcela "${p['nombre']}"';
-          break;
-        }
-      }
-    } catch (_) {}
-  }
-
-  // 4. Lanzar la notificación local con parámetros nombrados
-  if (debeNotificar) {
-    final plugin = FlutterLocalNotificationsPlugin();
-    await plugin.initialize(
-      settings: const InitializationSettings(
-        android: AndroidInitializationSettings('@mipmap/ic_launcher'),
-      ),
-    );
-
-    await plugin.show(
-      id: message.messageId?.hashCode ?? DateTime.now().millisecond,
-      title: data['title'] ?? '⚡ ALERTA FITOSANITARIA',
-      body: '${data['body'] ?? ''} $motivoAviso',
-      notificationDetails: NotificationDetails(
-        android: AndroidNotificationDetails(
-          canalNotificaciones.id,
-          canalNotificaciones.name,
-          importance: Importance.max,
-          priority: Priority.high,
-        ),
-      ),
-    );
-  }
-}
+Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {}
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
 
+  // En web (vista previa en navegador) no hay notificaciones push ni locales:
+  // solo se configuran en Android/iOS.
+  if (!kIsWeb) await _configurarNotificacionesNativas();
+
+  runApp(const AgribeeAlertApp());
+
+  // Se pide DESPUÉS de dibujar la app: antes se esperaba la respuesta al
+  // diálogo de permisos y la pantalla se quedaba en negro hasta contestar.
+  _pedirPermisoNotificaciones();
+}
+
+Future<void> _pedirPermisoNotificaciones() async {
+  try {
+    await FirebaseMessaging.instance.requestPermission(alert: true, badge: true, sound: true);
+    // El tema común ya no se usa: el servidor envía a cada dispositivo afectado.
+    // Se da de baja para que las versiones antiguas del servidor no avisen a todos.
+    if (!kIsWeb) await FirebaseMessaging.instance.unsubscribeFromTopic('avisos_generales');
+  } catch (e) {
+    debugPrint('No se pudo configurar FCM: $e');
+  }
+}
+
+Future<void> _configurarNotificacionesNativas() async {
   FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
 
   const AndroidInitializationSettings configuracionAndroid = AndroidInitializationSettings('@mipmap/ic_launcher');
-  const InitializationSettings configuracionInicial = InitializationSettings(android: configuracionAndroid);
+  const InitializationSettings configuracionInicial = InitializationSettings(
+    android: configuracionAndroid,
+    iOS: DarwinInitializationSettings(),
+  );
 
   await flutterLocalNotificationsPlugin.initialize(
     settings: configuracionInicial,
     onDidReceiveNotificationResponse: (NotificationResponse response) {
-      final payload = response.payload;
-      if (payload != null && payload.isNotEmpty) {
-        try {
-          final data = json.decode(payload);
-          ubicacionNotificacionSeleccionada.value = LatLng(
-            (data['lat'] as num).toDouble(),
-            (data['lng'] as num).toDouble(),
-          );
-        } catch (_) {}
-      }
+      _centrarMapaDesdePayload(response.payload);
     },
   );
+
+  // Si la app estaba cerrada y se abrió pulsando una notificación local,
+  // onDidReceiveNotificationResponse no se dispara: hay que leerlo aquí.
+  try {
+    final detallesLanzamiento = await flutterLocalNotificationsPlugin.getNotificationAppLaunchDetails();
+    if (detallesLanzamiento?.didNotificationLaunchApp ?? false) {
+      _centrarMapaDesdePayload(detallesLanzamiento!.notificationResponse?.payload);
+    }
+  } catch (_) {}
 
   await flutterLocalNotificationsPlugin
       .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
       ?.createNotificationChannel(canalNotificaciones);
 
-  await FirebaseMessaging.instance.requestPermission(alert: true, badge: true, sound: true);
-  await FirebaseMessaging.instance.subscribeToTopic('avisos_generales');
+  // iOS: mostrar el aviso como banner también con la app abierta.
+  await FirebaseMessaging.instance.setForegroundNotificationPresentationOptions(
+    alert: true,
+    badge: true,
+    sound: true,
+  );
 
-  runApp(MaterialApp(
+  // Android: con la app abierta, FCM no muestra la notificación; se muestra en local.
+  FirebaseMessaging.onMessage.listen(_mostrarAvisoEnPrimerPlano);
+
+  // Pulsar la notificación push (app en segundo plano o cerrada) centra el mapa en el aviso.
+  FirebaseMessaging.onMessageOpenedApp.listen(_centrarMapaDesdeMensaje);
+  try {
+    final mensajeInicial = await FirebaseMessaging.instance.getInitialMessage();
+    if (mensajeInicial != null) _centrarMapaDesdeMensaje(mensajeInicial);
+  } catch (_) {}
+}
+
+void _mostrarAvisoEnPrimerPlano(RemoteMessage message) {
+  // En iOS ya lo muestra el sistema (setForegroundNotificationPresentationOptions).
+  if (defaultTargetPlatform != TargetPlatform.android) return;
+  final notification = message.notification;
+  if (notification == null) return;
+
+  final lat = double.tryParse(message.data['lat'] ?? '');
+  final lng = double.tryParse(message.data['lng'] ?? '');
+  flutterLocalNotificationsPlugin.show(
+    id: (message.data['avisoId'] ?? message.messageId ?? notification.hashCode.toString()).hashCode,
+    title: notification.title,
+    body: notification.body,
+    payload: lat != null && lng != null ? json.encode({'lat': lat, 'lng': lng}) : null,
+    notificationDetails: NotificationDetails(
+      android: AndroidNotificationDetails(
+        canalNotificaciones.id,
+        canalNotificaciones.name,
+        channelDescription: canalNotificaciones.description,
+        icon: '@mipmap/ic_launcher',
+        importance: Importance.max,
+        priority: Priority.high,
+      ),
+    ),
+  );
+}
+
+void _centrarMapaDesdeMensaje(RemoteMessage message) {
+  final lat = double.tryParse(message.data['lat'] ?? '');
+  final lng = double.tryParse(message.data['lng'] ?? '');
+  if (lat != null && lng != null) {
+    ubicacionNotificacionSeleccionada.value = LatLng(lat, lng);
+  }
+}
+
+class AgribeeAlertApp extends StatelessWidget {
+  const AgribeeAlertApp({super.key});
+
+  @override
+  Widget build(BuildContext context) => MaterialApp(
     debugShowCheckedModeBanner: false,
     title: 'Agribee Alert',
     themeMode: ThemeMode.system,
@@ -163,110 +174,93 @@ void main() async {
         if (snapshot.connectionState == ConnectionState.waiting) return const Center(child: CircularProgressIndicator());
         if (snapshot.hasData && snapshot.data != null) {
           kUserIdActual = snapshot.data!.uid;
-          iniciarEscuchaAvisos(userIdActual: kUserIdActual);
-          return const MapaAvisosScreen();
+          registrarDispositivo(kUserIdActual);
+          // La key fuerza un estado nuevo si cambia el usuario (logout + login con otra cuenta).
+          return MapaAvisosScreen(key: ValueKey(kUserIdActual));
         }
         return const LoginScreen();
       },
     ),
-  ));
+  );
 }
 
-final Set<String> _avisosProcesados = {};
+void _centrarMapaDesdePayload(String? payload) {
+  if (payload == null || payload.isEmpty) return;
+  try {
+    final data = json.decode(payload);
+    ubicacionNotificacionSeleccionada.value = LatLng(
+      (data['lat'] as num).toDouble(),
+      (data['lng'] as num).toDouble(),
+    );
+  } catch (_) {}
+}
 
-void iniciarEscuchaAvisos({required String userIdActual}) {
-  FirebaseFirestore.instance
-      .collection('avisos')
-      .snapshots()
-      .listen((snapshot) async {
-    final parcelasSnapshot = await FirebaseFirestore.instance
-        .collection('mis_parcelas')
-        .where('userId', isEqualTo: userIdActual)
-        .get();
+// ---------------------------------------------------------------------------
+// Registro del dispositivo para que el servidor sepa a quién avisar.
+// Se guarda en usuarios/{uid}: los tokens FCM de sus móviles y su última
+// ubicación conocida. Las parcelas ya están en mis_parcelas.
+// ---------------------------------------------------------------------------
 
-    Position? posicionActual;
-    try {
-      if (await Geolocator.isLocationServiceEnabled()) {
-        posicionActual = await Geolocator.getLastKnownPosition() ??
-            await Geolocator.getCurrentPosition(
-                timeLimit: const Duration(seconds: 4));
-      }
-    } catch (_) {}
+StreamSubscription<String>? _suscripcionToken;
+String? _uidRegistrado;
 
-    for (var change in snapshot.docChanges) {
-      if (change.type == DocumentChangeType.added) {
-        if (_avisosProcesados.contains(change.doc.id)) continue;
-        _avisosProcesados.add(change.doc.id);
+DocumentReference<Map<String, dynamic>> _docUsuario(String uid) =>
+    FirebaseFirestore.instance.collection('usuarios').doc(uid);
 
-        final data = change.doc.data();
-        if (data == null) continue;
+Future<void> registrarDispositivo(String uid) async {
+  if (kIsWeb || _uidRegistrado == uid) return;
+  _uidRegistrado = uid;
 
-        if (data['creatorUid'] == userIdActual) continue;
+  Future<void> guardarToken(String token) => _docUsuario(uid).set({
+        'fcmTokens': FieldValue.arrayUnion([token]),
+        'tokenActualizado': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
 
-        final fecha = (data['fecha'] as Timestamp?)?.toDate();
-        if (fecha != null && DateTime.now().difference(fecha).inMinutes > 2) continue;
+  _suscripcionToken?.cancel();
+  _suscripcionToken = FirebaseMessaging.instance.onTokenRefresh.listen(
+    (token) => guardarToken(token).catchError((_) {}),
+  );
 
-        final double avisoLat = (data['latitud'] as num).toDouble();
-        final double avisoLng = (data['longitud'] as num).toDouble();
-        final double avisoRadioKm = (data['radioKm'] as num?)?.toDouble() ?? 1.0;
-
-        bool debeNotificar = false;
-        String motivoAviso = '';
-
-        if (posicionActual != null) {
-          double distUsuario = Geolocator.distanceBetween(
-            posicionActual.latitude,
-            posicionActual.longitude,
-            avisoLat,
-            avisoLng,
-          );
-          if (distUsuario <= (avisoRadioKm * 1000)) {
-            debeNotificar = true;
-            motivoAviso = 'cerca de tu posición actual';
-          }
-        }
-
-        if (!debeNotificar) {
-          for (var doc in parcelasSnapshot.docs) {
-            final pData = doc.data();
-            final double pLat = (pData['latitud'] as num).toDouble();
-            final double pLng = (pData['longitud'] as num).toDouble();
-            final double pRadioKm = (pData['radioAvisoKm'] as num?)?.toDouble() ?? 2.0;
-
-            final double distParcela = Geolocator.distanceBetween(pLat, pLng, avisoLat, avisoLng);
-
-            if (distParcela <= ((avisoRadioKm + pRadioKm) * 1000)) {
-              debeNotificar = true;
-              motivoAviso = 'cerca de tu parcela "${pData['nombre']}"';
-              break;
-            }
-          }
-        }
-
-        if (debeNotificar) {
-          final String payload = json.encode({
-            'lat': avisoLat,
-            'lng': avisoLng,
-          });
-
-          await flutterLocalNotificationsPlugin.show(
-            id: change.doc.id.hashCode,
-            title: '⚡ ALERTA FITOSANITARIA',
-            body: 'Tratamiento de ${data['cultivo'] ?? 'fitosanitario'} $motivoAviso.',
-            payload: payload,
-            notificationDetails: NotificationDetails(
-              android: AndroidNotificationDetails(
-                canalNotificaciones.id,
-                canalNotificaciones.name,
-                importance: Importance.max,
-                priority: Priority.high,
-              ),
-            ),
-          );
-        }
+  try {
+    // En iOS, getToken falla si Apple (APNs) todavía no ha entregado su token.
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      for (var i = 0; i < 5; i++) {
+        if (await FirebaseMessaging.instance.getAPNSToken() != null) break;
+        await Future.delayed(const Duration(seconds: 2));
       }
     }
-  });
+    final token = await FirebaseMessaging.instance.getToken();
+    if (token != null) await guardarToken(token);
+  } catch (e) {
+    debugPrint('No se pudo registrar el dispositivo para avisos: $e');
+  }
+}
+
+/// Quita este móvil de la cuenta al cerrar sesión (si no, seguiría recibiendo
+/// los avisos de ese usuario).
+Future<void> desregistrarDispositivo() async {
+  final uid = _uidRegistrado;
+  _uidRegistrado = null;
+  await _suscripcionToken?.cancel();
+  _suscripcionToken = null;
+  if (kIsWeb || uid == null) return;
+  try {
+    final token = await FirebaseMessaging.instance.getToken();
+    if (token != null) {
+      await _docUsuario(uid).update({'fcmTokens': FieldValue.arrayRemove([token])});
+    }
+  } catch (_) {}
+}
+
+/// Guarda la última ubicación conocida para que el servidor pueda avisar
+/// también por cercanía a la posición (no solo a las parcelas).
+void guardarUbicacionUsuario(LatLng posicion) {
+  if (kIsWeb) return;
+  _docUsuario(kUserIdActual).set({
+    'latitud': posicion.latitude,
+    'longitud': posicion.longitude,
+    'ubicacionActualizada': FieldValue.serverTimestamp(),
+  }, SetOptions(merge: true)).catchError((_) {});
 }
 
 class MapaAvisosScreen extends StatefulWidget {
@@ -293,6 +287,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
   final TextEditingController _searchController = TextEditingController();
   bool _buscando = false;
   Timer? _relojRefresco;
+  StreamSubscription<Position>? _suscripcionPosicion;
 
   int _avisosActivosTotal = 0;
   bool _dentroDeZonaRiesgo = false;
@@ -319,7 +314,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
     }
 
     _obtenerUbicacionActual();
-    _configurarEscuchaMensajesPush();
+
     ubicacionNotificacionSeleccionada.addListener(_onNotificacionPulsada);
 
     // Refresco periódico para actualizar visualmente los avisos caducados
@@ -328,8 +323,11 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
     });
 
     SharedPreferences.getInstance().then((prefs) {
+      if (!mounted) return;
       if (!prefs.containsKey('es_aplicador')) {
-        WidgetsBinding.instance.addPostFrameCallback((_) => _pedirPinInicial());
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _pedirPinInicial();
+        });
       } else {
         setState(() {
           _esModoAgricultor = prefs.getBool('es_aplicador') ?? false;
@@ -364,8 +362,9 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
               onPressed: () async {
                 final prefs = await SharedPreferences.getInstance();
                 await prefs.setBool('es_aplicador', false);
+                if (!mounted) return;
                 setState(() => _esModoAgricultor = false);
-                Navigator.pop(ctx);
+                if (ctx.mounted) Navigator.pop(ctx);
               },
               child: const Text('No soy técnico (Modo Vecino)', style: TextStyle(color: Colors.white54)),
             ),
@@ -375,8 +374,9 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                 if (pinController.text == '1234') {
                   final prefs = await SharedPreferences.getInstance();
                   await prefs.setBool('es_aplicador', true);
+                  if (!mounted) return;
                   setState(() => _esModoAgricultor = true);
-                  Navigator.pop(ctx);
+                  if (ctx.mounted) Navigator.pop(ctx);
                 } else {
                   ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('PIN incorrecto'), backgroundColor: Colors.redAccent));
                 }
@@ -391,73 +391,79 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
 
   void _onNotificacionPulsada() {
     final destino = ubicacionNotificacionSeleccionada.value;
-    if (destino != null) {
+    if (destino == null) return;
+    // Mientras se carga la ubicación el mapa aún no existe y mover el
+    // MapController lanzaría una excepción: se aplica al terminar la carga.
+    if (_cargandoUbicacion || !mounted) return;
+    try {
       _mapController.move(destino, 14.5);
       ubicacionNotificacionSeleccionada.value = null;
-    }
+    } catch (_) {}
   }
 
-  void _configurarEscuchaMensajesPush() {
-    FirebaseMessaging.onMessage.listen((RemoteMessage message) {
-      RemoteNotification? notification = message.notification;
-      AndroidNotification? android = message.notification?.android;
-
-      if (notification != null && android != null) {
-        flutterLocalNotificationsPlugin.show(
-          id: notification.hashCode,
-          title: notification.title,
-          body: notification.body,
-          notificationDetails: NotificationDetails(
-            android: AndroidNotificationDetails(
-              canalNotificaciones.id,
-              canalNotificaciones.name,
-              channelDescription: canalNotificaciones.description,
-              icon: android.smallIcon ?? '@mipmap/ic_launcher',
-              importance: Importance.max,
-              priority: Priority.high,
-            ),
-          ),
-        );
-      }
-    });
+  // Mientras la app está abierta, sigue la posición (cada 500 m de movimiento)
+  // para que el mapa y el servidor tengan la ubicación al día.
+  void _seguirUbicacion() {
+    _suscripcionPosicion?.cancel();
+    _suscripcionPosicion = Geolocator.getPositionStream(
+      locationSettings: const LocationSettings(distanceFilter: 500),
+    ).listen((posicion) {
+      final nueva = LatLng(posicion.latitude, posicion.longitude);
+      guardarUbicacionUsuario(nueva);
+      if (mounted) setState(() => _miUbicacionReal = nueva);
+    }, onError: (_) {});
   }
 
   @override
   void dispose() {
+    _suscripcionPosicion?.cancel();
     _relojRefresco?.cancel();
     ubicacionNotificacionSeleccionada.removeListener(_onNotificacionPulsada);
     _searchController.dispose();
     super.dispose();
   }
 
+  void _terminarCargaUbicacion() {
+    if (!mounted) return;
+    setState(() => _cargandoUbicacion = false);
+    // Si se pulsó una notificación mientras cargaba, centrar ahora que el mapa existe.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _onNotificacionPulsada());
+  }
+
+  // Antes: si el GPS fallaba o tardaba, la pantalla se quedaba en el spinner
+  // para siempre. Ahora hay límite de tiempo y siempre se muestra el mapa.
   Future<void> _obtenerUbicacionActual() async {
-    bool servicioHabilitado = await Geolocator.isLocationServiceEnabled();
-    if (!servicioHabilitado) {
-      setState(() => _cargandoUbicacion = false);
-      return;
-    }
+    try {
+      bool servicioHabilitado = await Geolocator.isLocationServiceEnabled();
+      if (!servicioHabilitado) return;
 
-    LocationPermission permiso = await Geolocator.checkPermission();
-    if (permiso == LocationPermission.denied) {
-      permiso = await Geolocator.requestPermission();
+      LocationPermission permiso = await Geolocator.checkPermission();
       if (permiso == LocationPermission.denied) {
-        setState(() => _cargandoUbicacion = false);
-        return;
+        permiso = await Geolocator.requestPermission();
       }
-    }
+      if (permiso == LocationPermission.denied || permiso == LocationPermission.deniedForever) return;
 
-    if (permiso == LocationPermission.deniedForever) {
-      setState(() => _cargandoUbicacion = false);
-      return;
-    }
+      Position? posicion;
+      try {
+        posicion = await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(timeLimit: Duration(seconds: 10)),
+        );
+      } catch (_) {
+        posicion = await Geolocator.getLastKnownPosition();
+      }
+      if (posicion == null || !mounted) return;
 
-    Position posicion = await Geolocator.getCurrentPosition();
-    setState(() {
+      // El mapa todavía no se ha construido: initialCenter usará esta posición,
+      // así que no hace falta (ni se puede) llamar a _mapController.move aquí.
       _miUbicacionReal = LatLng(posicion.latitude, posicion.longitude);
       _posicionSeleccionada = _miUbicacionReal!;
-      _cargandoUbicacion = false;
-    });
-    _mapController.move(_posicionSeleccionada, 12.0);
+      guardarUbicacionUsuario(_miUbicacionReal!);
+      _seguirUbicacion();
+    } catch (e) {
+      debugPrint('Error obteniendo ubicación: $e');
+    } finally {
+      _terminarCargaUbicacion();
+    }
   }
 
   void _zoomIn() {
@@ -484,10 +490,11 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
       );
       final respuesta = await http.get(url, headers: {
         'User-Agent': 'AvisosCampoApp/2026.1',
-      });
+      }).timeout(const Duration(seconds: 8));
 
       if (respuesta.statusCode == 200) {
         final List datos = json.decode(respuesta.body);
+        if (!mounted) return;
         if (datos.isNotEmpty) {
           final double lat = double.parse(datos[0]['lat']);
           final double lon = double.parse(datos[0]['lon']);
@@ -554,16 +561,16 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
         child: Container(
           padding: padding ?? const EdgeInsets.all(12),
           decoration: BoxDecoration(
-            color: const Color(0xFF10171D).withOpacity(0.72),
+            color: const Color(0xFF10171D).withValues(alpha: 0.72),
             borderRadius: BorderRadius.circular(radius),
             border: border ??
                 Border.all(
-                  color: Colors.white.withOpacity(0.08),
+                  color: Colors.white.withValues(alpha: 0.08),
                   width: 1.2,
                 ),
             boxShadow: [
               BoxShadow(
-                color: Colors.black.withOpacity(0.35),
+                color: Colors.black.withValues(alpha: 0.35),
                 blurRadius: 18,
                 offset: const Offset(0, 8),
               ),
@@ -608,7 +615,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                 top: 22,
                 bottom: MediaQuery.of(context).viewInsets.bottom + 22,
               ),
-              border: Border.all(color: const Color(0xFF00E5FF).withOpacity(0.3)),
+              border: Border.all(color: const Color(0xFF00E5FF).withValues(alpha: 0.3)),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -618,7 +625,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                       Container(
                         padding: const EdgeInsets.all(10),
                         decoration: BoxDecoration(
-                          color: const Color(0xFF00E5FF).withOpacity(0.12),
+                          color: const Color(0xFF00E5FF).withValues(alpha: 0.12),
                           shape: BoxShape.circle,
                         ),
                         child: const Icon(Icons.fence, color: Color(0xFF00E5FF), size: 22),
@@ -648,7 +655,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                             style: ElevatedButton.styleFrom(
                               backgroundColor: coordenadasElegidas == coordenadas 
                                   ? const Color(0xFF00E5FF) 
-                                  : Colors.white.withOpacity(0.05),
+                                  : Colors.white.withValues(alpha: 0.05),
                               foregroundColor: coordenadasElegidas == coordenadas 
                                   ? Colors.black : Colors.white70,
                               elevation: 0,
@@ -667,7 +674,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                             style: ElevatedButton.styleFrom(
                               backgroundColor: coordenadasElegidas == _miUbicacionReal 
                                   ? const Color(0xFF00E676) 
-                                  : Colors.white.withOpacity(0.05),
+                                  : Colors.white.withValues(alpha: 0.05),
                               foregroundColor: coordenadasElegidas == _miUbicacionReal 
                                   ? Colors.black : Colors.white70,
                               elevation: 0,
@@ -696,9 +703,9 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                     style: const TextStyle(color: Colors.white),
                     decoration: InputDecoration(
                       labelText: 'Nombre / Finca (ej. Cítricos Alguazas)',
-                      labelStyle: TextStyle(color: Colors.white.withOpacity(0.6)),
+                      labelStyle: TextStyle(color: Colors.white.withValues(alpha: 0.6)),
                       filled: true,
-                      fillColor: Colors.white.withOpacity(0.04),
+                      fillColor: Colors.white.withValues(alpha: 0.04),
                       border: OutlineInputBorder(
                         borderRadius: BorderRadius.circular(14),
                         borderSide: BorderSide.none,
@@ -707,14 +714,14 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                   ),
                   const SizedBox(height: 12),
                   DropdownButtonFormField<String>(
-                  value: tipoParcela,
+                  initialValue: tipoParcela,
                   dropdownColor: const Color(0xFF131A20),
                   style: const TextStyle(color: Colors.white),
                     decoration: InputDecoration(
                       labelText: 'Uso de la tierra',
-                      labelStyle: TextStyle(color: Colors.white.withOpacity(0.6)),
+                      labelStyle: TextStyle(color: Colors.white.withValues(alpha: 0.6)),
                       filled: true,
-                      fillColor: Colors.white.withOpacity(0.04),
+                      fillColor: Colors.white.withValues(alpha: 0.04),
                       border: OutlineInputBorder(
                         borderRadius: BorderRadius.circular(14),
                         borderSide: BorderSide.none,
@@ -766,42 +773,49 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                       ),
                       onPressed: () async {
-                        if (nombreController.text.trim().isEmpty) return;
+                        final nombre = nombreController.text.trim();
+                        if (nombre.isEmpty) return;
+                        // Se toma el ScaffoldMessenger de la pantalla, no del modal:
+                        // el contexto del modal deja de existir tras el pop.
+                        final messenger = ScaffoldMessenger.of(this.context);
                         Navigator.pop(modalCtx);
 
-                        if (esEdicion) {
-                          await FirebaseFirestore.instance
-                              .collection('mis_parcelas')
-                              .doc(idDocExistente)
-                              .update({
-                            'nombre': nombreController.text.trim(),
-                            'tipo': tipoParcela,
-                            'radioAvisoKm': radioParcela,
-                          });
-                        } else {
-                          await FirebaseFirestore.instance.collection('mis_parcelas').add({
-                            'userId': kUserIdActual,
-                            'nombre': nombreController.text.trim(),
-                            'tipo': tipoParcela,
-                            'latitud': coordenadasElegidas.latitude, 
-                            'longitud': coordenadasElegidas.longitude, 
-                            'radioAvisoKm': radioParcela,
-                            'fechaRegistro': FieldValue.serverTimestamp(),
-                          });
-                        }
-
-                        if (mounted) {
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(
-                              content: Text(
-                                esEdicion
-                                    ? 'Parcela actualizada correctamente'
-                                    : 'Parcela "${nombreController.text.trim()}" asegurada',
-                              ),
-                              backgroundColor: const Color(0xFF00B0FF),
-                            ),
+                        // Sin await: sin conexión, Firestore guarda en local al instante
+                        // pero el Future no se completa hasta sincronizar con el servidor.
+                        final Future<void> escritura = esEdicion
+                            ? FirebaseFirestore.instance
+                                .collection('mis_parcelas')
+                                .doc(idDocExistente)
+                                .update({
+                                'nombre': nombre,
+                                'tipo': tipoParcela,
+                                'radioAvisoKm': radioParcela,
+                              })
+                            : FirebaseFirestore.instance.collection('mis_parcelas').add({
+                                'userId': kUserIdActual,
+                                'nombre': nombre,
+                                'tipo': tipoParcela,
+                                'latitud': coordenadasElegidas.latitude,
+                                'longitud': coordenadasElegidas.longitude,
+                                'radioAvisoKm': radioParcela,
+                                'fechaRegistro': FieldValue.serverTimestamp(),
+                              });
+                        escritura.then((_) {}, onError: (Object e) {
+                          messenger.showSnackBar(
+                            SnackBar(content: Text('Error guardando la parcela: $e'), backgroundColor: Colors.redAccent),
                           );
-                        }
+                        });
+
+                        messenger.showSnackBar(
+                          SnackBar(
+                            content: Text(
+                              esEdicion
+                                  ? 'Parcela actualizada correctamente'
+                                  : 'Parcela "$nombre" asegurada',
+                            ),
+                            backgroundColor: const Color(0xFF00B0FF),
+                          ),
+                        );
                       },
                       child: Text(
                         esEdicion ? 'Actualizar Configuración' : 'Confirmar y Proteger',
@@ -827,7 +841,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
         return _glassContainer(
           radius: 28,
           padding: const EdgeInsets.all(22.0),
-          border: Border.all(color: const Color(0xFF00E5FF).withOpacity(0.2)),
+          border: Border.all(color: const Color(0xFF00E5FF).withValues(alpha: 0.2)),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -870,7 +884,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
               const SizedBox(height: 8),
               Text(
                 'Tus parcelas y colmenas reciben alerta de radio temprano en tiempo real.',
-                style: TextStyle(fontSize: 12, color: Colors.white.withOpacity(0.5)),
+                style: TextStyle(fontSize: 12, color: Colors.white.withValues(alpha: 0.5)),
               ),
               const Divider(height: 24, color: Colors.white10),
               StreamBuilder<QuerySnapshot>(
@@ -891,7 +905,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                       child: Center(
                         child: Text(
                           'No hay parcelas registradas. Añade una con el botón superior.',
-                          style: TextStyle(color: Colors.white.withOpacity(0.5)),
+                          style: TextStyle(color: Colors.white.withValues(alpha: 0.5)),
                         ),
                       ),
                     );
@@ -903,8 +917,8 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                     itemBuilder: (context, index) {
                       final doc = snapshot.data!.docs[index];
                       final p = doc.data() as Map<String, dynamic>;
-                      final pLat = (p['latitud'] as num).toDouble();
-                      final pLng = (p['longitud'] as num).toDouble();
+                      final pLat = (p['latitud'] as num?)?.toDouble() ?? 0;
+                      final pLng = (p['longitud'] as num?)?.toDouble() ?? 0;
                       final pRadio = (p['radioAvisoKm'] as num?)?.toDouble() ?? 2.5;
                       final punto = LatLng(pLat, pLng);
 
@@ -912,16 +926,16 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                         margin: const EdgeInsets.only(bottom: 10),
                         padding: const EdgeInsets.all(12),
                         decoration: BoxDecoration(
-                          color: Colors.white.withOpacity(0.03),
+                          color: Colors.white.withValues(alpha: 0.03),
                           borderRadius: BorderRadius.circular(14),
-                          border: Border.all(color: Colors.white.withOpacity(0.05)),
+                          border: Border.all(color: Colors.white.withValues(alpha: 0.05)),
                         ),
                         child: Row(
                           children: [
                             Container(
                               padding: const EdgeInsets.all(8),
                               decoration: BoxDecoration(
-                                color: const Color(0xFF00E5FF).withOpacity(0.12),
+                                color: const Color(0xFF00E5FF).withValues(alpha: 0.12),
                                 borderRadius: BorderRadius.circular(10),
                               ),
                               child: const Icon(Icons.fence, color: Color(0xFF00E5FF), size: 20),
@@ -935,7 +949,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                                   const SizedBox(height: 2),
                                   Text(
                                     '${p['tipo'] ?? 'Parcela'} • Radio: $pRadio km',
-                                    style: TextStyle(color: Colors.white.withOpacity(0.55), fontSize: 12),
+                                    style: TextStyle(color: Colors.white.withValues(alpha: 0.55), fontSize: 12),
                                   ),
                                 ],
                               ),
@@ -1019,9 +1033,10 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
       final url = Uri.parse(
         'https://nominatim.openstreetmap.org/reverse?lat=$lat&lon=$lng&format=json',
       );
+      // Con timeout: sin cobertura, esta llamada bloqueaba el guardado del aviso.
       final respuesta = await http.get(url, headers: {
         'User-Agent': 'AvisosCampoApp/2026.1',
-      });
+      }).timeout(const Duration(seconds: 5));
 
       if (respuesta.statusCode == 200) {
         final datos = json.decode(respuesta.body) as Map<String, dynamic>;
@@ -1086,7 +1101,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
           builder: (context, setModalState) {
             return _glassContainer(
               radius: 28,
-              border: Border.all(color: const Color(0xFF00E676).withOpacity(0.3)),
+              border: Border.all(color: const Color(0xFF00E676).withValues(alpha: 0.3)),
               padding: EdgeInsets.only(
                 left: 22,
                 right: 22,
@@ -1103,7 +1118,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                         Container(
                           padding: const EdgeInsets.all(8),
                           decoration: BoxDecoration(
-                            color: const Color(0xFF00E676).withOpacity(0.12),
+                            color: const Color(0xFF00E676).withValues(alpha: 0.12),
                             shape: BoxShape.circle,
                           ),
                           child: const Icon(Icons.sensors, color: Color(0xFF00E676), size: 24),
@@ -1123,9 +1138,9 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                         margin: const EdgeInsets.only(bottom: 14),
                         padding: const EdgeInsets.all(13),
                         decoration: BoxDecoration(
-                          color: Colors.orangeAccent.withOpacity(0.14),
+                          color: Colors.orangeAccent.withValues(alpha: 0.14),
                           borderRadius: BorderRadius.circular(14),
-                          border: Border.all(color: Colors.orangeAccent.withOpacity(0.55)),
+                          border: Border.all(color: Colors.orangeAccent.withValues(alpha: 0.55)),
                         ),
                         child: Row(
                           crossAxisAlignment: CrossAxisAlignment.start,
@@ -1151,9 +1166,9 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                         margin: const EdgeInsets.only(bottom: 14),
                         padding: const EdgeInsets.all(11),
                         decoration: BoxDecoration(
-                          color: const Color(0xFF00E676).withOpacity(0.08),
+                          color: const Color(0xFF00E676).withValues(alpha: 0.08),
                           borderRadius: BorderRadius.circular(14),
-                          border: Border.all(color: const Color(0xFF00E676).withOpacity(0.25)),
+                          border: Border.all(color: const Color(0xFF00E676).withValues(alpha: 0.25)),
                         ),
                         child: Row(
                           children: [
@@ -1172,7 +1187,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                         margin: const EdgeInsets.only(bottom: 14),
                         padding: const EdgeInsets.all(11),
                         decoration: BoxDecoration(
-                          color: Colors.white.withOpacity(0.04),
+                          color: Colors.white.withValues(alpha: 0.04),
                           borderRadius: BorderRadius.circular(14),
                           border: Border.all(color: Colors.white10),
                         ),
@@ -1197,9 +1212,9 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                         margin: const EdgeInsets.only(bottom: 14),
                         padding: const EdgeInsets.all(13),
                         decoration: BoxDecoration(
-                          color: Colors.blueAccent.withOpacity(0.14),
+                          color: Colors.blueAccent.withValues(alpha: 0.14),
                           borderRadius: BorderRadius.circular(14),
-                          border: Border.all(color: Colors.blueAccent.withOpacity(0.55)),
+                          border: Border.all(color: Colors.blueAccent.withValues(alpha: 0.55)),
                         ),
                         child: Row(
                           crossAxisAlignment: CrossAxisAlignment.start,
@@ -1218,24 +1233,24 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                     ],
 
                     DropdownButtonFormField<String>(
-                      value: tipoSeleccionado,
+                      initialValue: tipoSeleccionado,
                       dropdownColor: const Color(0xFF131A20),
                       decoration: InputDecoration(
                         labelText: 'Compuesto aplicado',
-                        labelStyle: TextStyle(color: Colors.white.withOpacity(0.6)),
+                        labelStyle: TextStyle(color: Colors.white.withValues(alpha: 0.6)),
                         filled: true,
-                        fillColor: Colors.white.withOpacity(0.04),
+                        fillColor: Colors.white.withValues(alpha: 0.04),
                         border: OutlineInputBorder(
                           borderRadius: BorderRadius.circular(14),
                           borderSide: BorderSide.none,
                         ),
                       ),
                       items: const [
-                        DropdownMenuItem(value: 'Insecticida', child: Text('🧪 Insecticida', style: const TextStyle(color: Colors.white))),
-                        DropdownMenuItem(value: 'Fungicida', child: Text('🍄 Fungicida', style: const TextStyle(color: Colors.white))),
-                        DropdownMenuItem(value: 'Herbicida', child: Text('🌿 Herbicida', style: const TextStyle(color: Colors.white))),
-                        DropdownMenuItem(value: 'Tratamiento Ecológico', child: Text('🍃 Tratamiento Ecológico', style: const TextStyle(color: Colors.white))),
-                        DropdownMenuItem(value: 'Acaricida', child: Text('🔬 Acaricida', style: const TextStyle(color: Colors.white))),
+                        DropdownMenuItem(value: 'Insecticida', child: Text('🧪 Insecticida', style: TextStyle(color: Colors.white))),
+                        DropdownMenuItem(value: 'Fungicida', child: Text('🍄 Fungicida', style: TextStyle(color: Colors.white))),
+                        DropdownMenuItem(value: 'Herbicida', child: Text('🌿 Herbicida', style: TextStyle(color: Colors.white))),
+                        DropdownMenuItem(value: 'Tratamiento Ecológico', child: Text('🍃 Tratamiento Ecológico', style: TextStyle(color: Colors.white))),
+                        DropdownMenuItem(value: 'Acaricida', child: Text('🔬 Acaricida', style: TextStyle(color: Colors.white))),
                       ],
                       onChanged: (val) {
                         if (val != null) setModalState(() => tipoSeleccionado = val);
@@ -1247,9 +1262,9 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                       style: const TextStyle(color: Colors.white),
                       decoration: InputDecoration(
                         labelText: 'Cultivo / Sector (ej. Cítricos, Olivar, Huerta)',
-                        labelStyle: TextStyle(color: Colors.white.withOpacity(0.6)),
+                        labelStyle: TextStyle(color: Colors.white.withValues(alpha: 0.6)),
                         filled: true,
-                        fillColor: Colors.white.withOpacity(0.04),
+                        fillColor: Colors.white.withValues(alpha: 0.04),
                         border: OutlineInputBorder(
                           borderRadius: BorderRadius.circular(14),
                           borderSide: BorderSide.none,
@@ -1286,9 +1301,9 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                       style: const TextStyle(color: Colors.white),
                       decoration: InputDecoration(
                         labelText: 'Observaciones (ej. Atención colmenas, viento en calma)',
-                        labelStyle: TextStyle(color: Colors.white.withOpacity(0.6)),
+                        labelStyle: TextStyle(color: Colors.white.withValues(alpha: 0.6)),
                         filled: true,
-                        fillColor: Colors.white.withOpacity(0.04),
+                        fillColor: Colors.white.withValues(alpha: 0.04),
                         border: OutlineInputBorder(
                           borderRadius: BorderRadius.circular(14),
                           borderSide: BorderSide.none,
@@ -1328,6 +1343,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                           : () async {
                               Navigator.pop(context);
                               await _guardarAvisoEnFirebase(
+                                punto: puntoEmision,
                                 tipo: tipoSeleccionado,
                                 cultivo: cultivoController.text.trim().isEmpty
                                     ? 'No especificado'
@@ -1350,6 +1366,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
   }
 
   Future<void> _guardarAvisoEnFirebase({
+    required LatLng punto,
     required String tipo,
     required String cultivo,
     required int duracionHoras,
@@ -1358,6 +1375,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
   }) async {
     final DateTime ahora = DateTime.now();
     final DateTime expiraEn = ahora.add(Duration(hours: duracionHoras));
+    final double radioKm = _radioKm;
 
     // 1. Comprobar si hay internet
     bool hayConexion = true;
@@ -1367,18 +1385,21 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
     } catch (_) {}
 
     try {
-      final localidad = await obtenerNombreMunicipio(
-        _posicionSeleccionada.latitude,
-        _posicionSeleccionada.longitude,
-      );
+      // Sin conexión no tiene sentido esperar a Nominatim.
+      final localidad = hayConexion
+          ? await obtenerNombreMunicipio(punto.latitude, punto.longitude)
+          : 'Ubicación en campo';
 
-      // 2. Guardar en Firestore (Esto funciona SIEMPRE, con red o sin red gracias al caché local)
-      await FirebaseFirestore.instance.collection('avisos').add({
+      // 2. Guardar en Firestore. Se usa el punto capturado al abrir el formulario
+      // (antes se leía _posicionSeleccionada al guardar, que podía haber cambiado).
+      // Sin await: sin conexión el Future no se completa hasta sincronizar, y el
+      // usuario se quedaba sin confirmación. Firestore lo guarda en local al instante.
+      final escritura = FirebaseFirestore.instance.collection('avisos').add({
         'creatorUid': kUserIdActual,
-        'latitud': _posicionSeleccionada.latitude,
-        'longitud': _posicionSeleccionada.longitude,
+        'latitud': punto.latitude,
+        'longitud': punto.longitude,
         'localidad': localidad,
-        'radioKm': _radioKm,
+        'radioKm': radioKm,
         'tipo': tipo,
         'cultivo': cultivo,
         'duracionHoras': duracionHoras,
@@ -1387,31 +1408,16 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
         'fecha': FieldValue.serverTimestamp(),
         'expiraEn': Timestamp.fromDate(expiraEn),
       });
-
-      // 3. Mandar la notificación Push SOLO si hay red
       if (hayConexion) {
-        try {
-          await http.post(
-            Uri.parse('https://fcm.googleapis.com/fcm/send'),
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': 'key=TU_CLAVE_DEL_SERVIDOR_FIREBASE' // Mantén la tuya
-            },
-            body: json.encode({
-              'to': '/topics/avisos_generales',
-              // Solo bloque data
-              'data': {
-                'title': '⚡ ALERTA FITOSANITARIA',
-                'body': 'Nuevo tratamiento de $tipo en $localidad.',
-                'lat': _posicionSeleccionada.latitude.toString(),
-                'lng': _posicionSeleccionada.longitude.toString(),
-                'radioKm': _radioKm.toString(),
-                'creatorUid': kUserIdActual,
-              },
-            }),
-          );
-        } catch (_) {}
+        await escritura;
+      } else {
+        escritura.ignore();
       }
+
+      // 3. El push lo envía el servidor (servidor_avisos.js o la Cloud Function)
+      // al detectar el documento nuevo. Aquí había una llamada a la API antigua
+      // de FCM (fcm/send), que Google dio de baja en 2024 y que además exigía
+      // meter la clave del servidor dentro de la app.
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -1447,7 +1453,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
             return _glassContainer(
               radius: 28,
               padding: const EdgeInsets.all(16),
-              border: Border.all(color: const Color(0xFF00E5FF).withOpacity(0.25)),
+              border: Border.all(color: const Color(0xFF00E5FF).withValues(alpha: 0.25)),
               child: StreamBuilder<QuerySnapshot>(
                 stream: FirebaseFirestore.instance.collection('avisos').snapshots(),
                 builder: (context, snapshot) {
@@ -1464,11 +1470,11 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                     final bool vigente = expiraEn == null ||
                         expiraEn.toDate().isAfter(DateTime.now());
                     if (!vigente) return false;
-                    if (_miUbicacionReal == null) return true;
 
                     final lat = (data['latitud'] as num?)?.toDouble();
                     final lng = (data['longitud'] as num?)?.toDouble();
                     if (lat == null || lng == null) return false;
+                    if (_miUbicacionReal == null) return true;
 
                     final distancia = Geolocator.distanceBetween(
                       _miUbicacionReal!.latitude,
@@ -1548,7 +1554,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                         child: ListView.separated(
                           controller: scrollController,
                           itemCount: docs.length,
-                          separatorBuilder: (_, __) =>
+                          separatorBuilder: (_, _) =>
                               const Divider(color: Colors.white10, height: 1),
                           itemBuilder: (context, index) {
                             final doc = docs[index];
@@ -1605,7 +1611,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
     required LatLng puntoAviso,
     required bool activo,
   }) {
-    final radioKm = (data['radioKm'] as num).toDouble();
+    final radioKm = (data['radioKm'] as num?)?.toDouble() ?? 1.0;
     final tipo = data['tipo'] ?? 'Fumigación';
     final cultivo = data['cultivo'] ?? 'No especificado';
     final duracionHoras = data['duracionHoras'] ?? 24;
@@ -1655,8 +1661,8 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
           radius: 28,
           border: Border.all(
             color: enPeligro
-                ? Colors.redAccent.withOpacity(0.5)
-                : (activo ? const Color(0xFF00E676).withOpacity(0.3) : Colors.white12),
+                ? Colors.redAccent.withValues(alpha: 0.5)
+                : (activo ? const Color(0xFF00E676).withValues(alpha: 0.3) : Colors.white12),
           ),
           padding: const EdgeInsets.all(22),
           child: Column(
@@ -1669,8 +1675,8 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                     padding: const EdgeInsets.all(10),
                     decoration: BoxDecoration(
                       color: enPeligro
-                          ? Colors.redAccent.withOpacity(0.2)
-                          : (activo ? const Color(0xFF00E676).withOpacity(0.15) : Colors.white10),
+                          ? Colors.redAccent.withValues(alpha: 0.2)
+                          : (activo ? const Color(0xFF00E676).withValues(alpha: 0.15) : Colors.white10),
                       shape: BoxShape.circle,
                     ),
                     child: Icon(
@@ -1709,7 +1715,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                           '¿Estás seguro de que deseas cancelar este aviso y retirarlo del mapa?'
                         );
                         if (confirmar) {
-                          Navigator.pop(context);
+                          if (context.mounted) Navigator.pop(context);
                           await FirebaseFirestore.instance.collection('avisos').doc(idDoc).delete();
                         }
                       },
@@ -1728,17 +1734,17 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
               ],
               if (observaciones.toString().isNotEmpty) ...[
                 const SizedBox(height: 8),
-                Text('📝 $observaciones', style: TextStyle(fontStyle: FontStyle.italic, color: Colors.white.withOpacity(0.75))),
+                Text('📝 $observaciones', style: TextStyle(fontStyle: FontStyle.italic, color: Colors.white.withValues(alpha: 0.75))),
               ],
               const SizedBox(height: 14),
               Container(
                 width: double.infinity,
                 padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                 decoration: BoxDecoration(
-                  color: enPeligro ? Colors.redAccent.withOpacity(0.15) : Colors.white.withOpacity(0.04),
+                  color: enPeligro ? Colors.redAccent.withValues(alpha: 0.15) : Colors.white.withValues(alpha: 0.04),
                   borderRadius: BorderRadius.circular(12),
                   border: Border.all(
-                    color: enPeligro ? Colors.redAccent.withOpacity(0.4) : Colors.white10,
+                    color: enPeligro ? Colors.redAccent.withValues(alpha: 0.4) : Colors.white10,
                   ),
                 ),
                 child: Text(
@@ -1763,7 +1769,12 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
   Widget build(BuildContext context) {
     String tileUrl = '';
     if (_tipoMapa == 0) {
-      tileUrl = 'https://tiles.stadiamaps.com/tiles/alidade_smooth_dark/{z}/{x}/{y}.png?api_key=60a076e8-a8da-4805-ad4b-0da89dffd67a';
+      // La clave de Stadia ya no está en el código (se subiría a GitHub):
+      // se pasa al compilar con --dart-define-from-file=claves.json.
+      // Sin clave se usa el mapa oscuro de CARTO, que no la necesita.
+      tileUrl = kStadiaApiKey.isNotEmpty
+          ? 'https://tiles.stadiamaps.com/tiles/alidade_smooth_dark/{z}/{x}/{y}.png?api_key=$kStadiaApiKey'
+          : 'https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png';
     } else if (_tipoMapa == 1) {
       tileUrl = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
     } else if (_tipoMapa == 2) {
@@ -1791,8 +1802,9 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                     children: [
                       if (_tipoMapa == 3)
                         TileLayer(
+                          // https: Android bloquea por defecto el tráfico http sin cifrar.
                           wmsOptions: WMSTileLayerOptions(
-                            baseUrl: 'http://ovc.catastro.meh.es/Cartografia/WMS/ServidorWMS.aspx?',
+                            baseUrl: 'https://ovc.catastro.meh.es/Cartografia/WMS/ServidorWMS.aspx?',
                             layers: const ['Catastro'],
                             transparent: true,
                             format: 'image/png',
@@ -1827,14 +1839,15 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                               if (snapshotParcelas.hasData) {
                                 for (var doc in snapshotParcelas.data!.docs) {
                                   final pData = doc.data() as Map<String, dynamic>;
-                                  final pLat = (pData['latitud'] as num).toDouble();
-                                  final pLng = (pData['longitud'] as num).toDouble();
+                                  final pLat = (pData['latitud'] as num?)?.toDouble();
+                                  final pLng = (pData['longitud'] as num?)?.toDouble();
+                                  if (pLat == null || pLng == null) continue;
                                   final pRadio = (pData['radioAvisoKm'] as num?)?.toDouble() ?? 2.5;
                                   final puntoP = LatLng(pLat, pLng);
 
                                   circulosGuardados.add(CircleMarker(
                                     point: puntoP,
-                                    color: const Color(0xFF00E5FF).withOpacity(0.12),
+                                    color: const Color(0xFF00E5FF).withValues(alpha: 0.12),
                                     borderColor: const Color(0xFF00E5FF),
                                     borderStrokeWidth: 1.5,
                                     useRadiusInMeter: true,
@@ -1851,7 +1864,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                                         decoration: BoxDecoration(
                                           color: const Color(0xFF00E5FF),
                                           shape: BoxShape.circle,
-                                          boxShadow: [BoxShadow(color: const Color(0xFF00E5FF).withOpacity(0.6), blurRadius: 10)],
+                                          boxShadow: [BoxShadow(color: const Color(0xFF00E5FF).withValues(alpha: 0.6), blurRadius: 10)],
                                         ),
                                         child: const Icon(Icons.fence, color: Color(0xFF06141B), size: 20),
                                       ),
@@ -1872,9 +1885,13 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                                   final tipo = data['tipo'] ?? 'Fumigación';
                                   if (_filtroTipo != 'Todos' && tipo != _filtroTipo) continue;
 
-                                  final lat = (data['latitud'] as num).toDouble();
-                                  final lng = (data['longitud'] as num).toDouble();
-                                  final radioKm = (data['radioKm'] as num).toDouble();
+                                  // Un solo documento sin coordenadas tumbaba todo el mapa.
+                                  final latN = (data['latitud'] as num?)?.toDouble();
+                                  final lngN = (data['longitud'] as num?)?.toDouble();
+                                  if (latN == null || lngN == null) continue;
+                                  final double lat = latN;
+                                  final double lng = lngN;
+                                  final radioKm = (data['radioKm'] as num?)?.toDouble() ?? 1.0;
                                   final puntoAviso = LatLng(lat, lng);
 
                                   if (activo && _miUbicacionReal != null) {
@@ -1888,7 +1905,10 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                                       final pLat = (p['latitud'] as num?)?.toDouble();
                                       final pLng = (p['longitud'] as num?)?.toDouble();
                                       if (pLat == null || pLng == null) continue;
-                                      if (Geolocator.distanceBetween(pLat, pLng, lat, lng) <= 3000) {
+                                      // Mismo criterio que las notificaciones: radio del aviso + radio
+                                      // de la parcela (antes había un 3 km fijo que no cuadraba).
+                                      final pRadioKm = (p['radioAvisoKm'] as num?)?.toDouble() ?? 2.0;
+                                      if (Geolocator.distanceBetween(pLat, pLng, lat, lng) <= (radioKm + pRadioKm) * 1000) {
                                         afectaMisParcelas = true;
                                         break;
                                       }
@@ -1898,7 +1918,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                                   final Color colorPerimetro = afectaMisParcelas ? Colors.redAccent : (activo ? Colors.redAccent : Colors.white30);
 
                                   circulosGuardados.add(CircleMarker(
-                                    point: puntoAviso, color: colorPerimetro.withOpacity(activo ? 0.16 : 0.05),
+                                    point: puntoAviso, color: colorPerimetro.withValues(alpha: activo ? 0.16 : 0.05),
                                     borderColor: colorPerimetro, borderStrokeWidth: activo ? 2.0 : 1.0,
                                     useRadiusInMeter: true, radius: radioKm * 1000,
                                   ));
@@ -1908,7 +1928,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                                     child: GestureDetector(
                                       onTap: () => _mostrarDetallesAviso(idDoc: doc.id, data: data, puntoAviso: puntoAviso, activo: activo),
                                       child: Container(
-                                        decoration: BoxDecoration(color: colorPerimetro.withOpacity(0.18), shape: BoxShape.circle),
+                                        decoration: BoxDecoration(color: colorPerimetro.withValues(alpha: 0.18), shape: BoxShape.circle),
                                         child: Icon(activo ? Icons.sensors : Icons.check_circle_outline, color: colorPerimetro, size: 28),
                                       ),
                                     ),
@@ -1936,7 +1956,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                                       ...circulosGuardados,
                                       if (_esModoAgricultor)
                                         CircleMarker(
-                                          point: _posicionSeleccionada, color: const Color(0xFF00E676).withOpacity(0.2),
+                                          point: _posicionSeleccionada, color: const Color(0xFF00E676).withValues(alpha: 0.2),
                                           borderColor: const Color(0xFF00E676), borderStrokeWidth: 2,
                                           useRadiusInMeter: true, radius: _radioKm * 1000,
                                         ),
@@ -1947,7 +1967,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                                       if (_miUbicacionReal != null)
                                         Marker(
                                           point: _miUbicacionReal!, width: 24, height: 24,
-                                          child: IgnorePointer(child: Container(decoration: BoxDecoration(color: const Color(0xFF00E5FF), shape: BoxShape.circle, border: Border.all(color: Colors.white, width: 3), boxShadow: [BoxShadow(color: const Color(0xFF00E5FF).withOpacity(0.8), blurRadius: 10)]))),
+                                          child: IgnorePointer(child: Container(decoration: BoxDecoration(color: const Color(0xFF00E5FF), shape: BoxShape.circle, border: Border.all(color: Colors.white, width: 3), boxShadow: [BoxShadow(color: const Color(0xFF00E5FF).withValues(alpha: 0.8), blurRadius: 10)]))),
                                         ),
                                       if (_esModoAgricultor)
                                         Marker(
@@ -1996,7 +2016,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                                 const SizedBox(width: 6),
                                 Container(
                                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                  decoration: BoxDecoration(color: Colors.white.withOpacity(0.08), borderRadius: BorderRadius.circular(10)),
+                                  decoration: BoxDecoration(color: Colors.white.withValues(alpha: 0.08), borderRadius: BorderRadius.circular(10)),
                                   child: Text('$_avisosActivosTotal', style: const TextStyle(fontSize: 11, color: Color(0xFF00E676), fontWeight: FontWeight.bold)), // <-- AQUI USA LA NUEVA VARIABLE
                                 ),
                               ],
@@ -2022,7 +2042,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                                 // De Aplicador a Vecino (sin contraseña)
                                 final prefs = await SharedPreferences.getInstance();
                                 await prefs.setBool('es_aplicador', false);
-                                setState(() => _esModoAgricultor = false);
+                                if (mounted) setState(() => _esModoAgricultor = false);
                               } else {
                                 // De Vecino a Aplicador (Pide PIN)
                                 showDialog(
@@ -2044,8 +2064,9 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                                             if (pinController.text == '1234') {
                                               final prefs = await SharedPreferences.getInstance();
                                               await prefs.setBool('es_aplicador', true);
+                                              if (!mounted) return;
                                               setState(() => _esModoAgricultor = true);
-                                              Navigator.pop(ctx);
+                                              if (ctx.mounted) Navigator.pop(ctx);
                                             } else {
                                               ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('PIN incorrecto'), backgroundColor: Colors.redAccent));
                                             }
@@ -2061,6 +2082,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                               // Cerrar Sesión
                               final prefs = await SharedPreferences.getInstance();
                               await prefs.remove('es_aplicador');
+                              await desregistrarDispositivo();
                               await FirebaseAuth.instance.signOut();
                             }
                           },
@@ -2113,7 +2135,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                   Positioned(
                     top: 115, left: 14, right: 14,
                     child: _glassContainer(
-                      radius: 14, border: Border.all(color: Colors.redAccent.withOpacity(0.6)), padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                      radius: 14, border: Border.all(color: Colors.redAccent.withValues(alpha: 0.6)), padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                       child: const Row(
                         children: [
                           Icon(Icons.warning_amber_rounded, color: Colors.redAccent, size: 22),
@@ -2130,7 +2152,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                     child: InkWell(
                       onTap: _mostrarMenuParcelas, borderRadius: BorderRadius.circular(20),
                       child: _glassContainer(
-                        radius: 20, border: Border.all(color: const Color(0xFF00E5FF).withOpacity(0.4)), padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                        radius: 20, border: Border.all(color: const Color(0xFF00E5FF).withValues(alpha: 0.4)), padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
                         child: const Row(mainAxisSize: MainAxisSize.min, children: [Icon(Icons.shield_outlined, color: Color(0xFF00E5FF), size: 20), SizedBox(width: 8), Text('Mis Parcelas', style: TextStyle(color: Color(0xFF00E5FF), fontWeight: FontWeight.bold, fontSize: 13))]),
                       ),
                     ),
@@ -2197,7 +2219,7 @@ _glassContainer(
                     child: SafeArea(
                       top: false,
                       child: _glassContainer(
-                        radius: 24, border: Border.all(color: const Color(0xFF00E676).withOpacity(0.4)), padding: const EdgeInsets.all(16),
+                        radius: 24, border: Border.all(color: const Color(0xFF00E676).withValues(alpha: 0.4)), padding: const EdgeInsets.all(16),
                         child: Column(
                           mainAxisSize: MainAxisSize.min,
                           children: [
@@ -2235,7 +2257,7 @@ _glassContainer(
           builder: (context, scrollController) {
             return _glassContainer(
               radius: 28, padding: const EdgeInsets.all(16),
-              border: Border.all(color: const Color(0xFF00E676).withOpacity(0.4)),
+              border: Border.all(color: const Color(0xFF00E676).withValues(alpha: 0.4)),
               child: Column(
                 children: [
                   Row(
@@ -2247,7 +2269,7 @@ _glassContainer(
                             Icon(Icons.menu_book_rounded, color: Color(0xFF00E676)),
                             SizedBox(width: 8),
                             Expanded(
-                              child: Text('Cuaderno de Explotación', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
+                              child: Text('Cuaderno de Explotación', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
                                 overflow: TextOverflow.ellipsis, // Añade puntos suspensivos si no cabe
                               ),
                             ),
@@ -2351,7 +2373,9 @@ _glassContainer(
           .where('creatorUid', isEqualTo: kUserIdActual).get(); // Eliminado el orderBy
 
       if (snapshot.docs.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No hay datos para exportar')));
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No hay datos para exportar')));
+        }
         return;
       }
 
@@ -2403,6 +2427,9 @@ _glassContainer(
       );
     } catch (e) {
       debugPrint('Error generando PDF: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error al generar PDF: $e')));
+      }
     }
   }
 
@@ -2422,7 +2449,15 @@ _glassContainer(
         ['Fecha', 'Cultivo', 'Tratamiento', 'Localidad', 'Viento (km/h)', 'Observaciones']
       ];
 
-      for (var doc in snapshot.docs) {
+      // Mismo orden que el cuaderno y el PDF (más reciente primero).
+      final docs = snapshot.docs.toList()
+        ..sort((a, b) {
+          final aFecha = (a.data()['fecha'] as Timestamp?)?.toDate() ?? DateTime.fromMillisecondsSinceEpoch(0);
+          final bFecha = (b.data()['fecha'] as Timestamp?)?.toDate() ?? DateTime.fromMillisecondsSinceEpoch(0);
+          return bFecha.compareTo(aFecha);
+        });
+
+      for (var doc in docs) {
         final d = doc.data();
         final fecha = (d['fecha'] as Timestamp?)?.toDate();
         filas.add([
@@ -2447,7 +2482,11 @@ _glassContainer(
       await archivo.writeAsString(csvData);
 
       // 4. Desplegar el menú nativo de Android/iOS para compartir el documento
-      await Share.shareXFiles([XFile(rutaArchivo)], text: 'Adjunto registro histórico de tratamientos fitosanitarios.');
+      // API actual de share_plus (Share.shareXFiles está obsoleta desde la v11).
+      await SharePlus.instance.share(ShareParams(
+        files: [XFile(rutaArchivo)],
+        text: 'Adjunto registro histórico de tratamientos fitosanitarios.',
+      ));
 
     } catch (e) {
       debugPrint('Error CSV: $e');
@@ -2470,6 +2509,13 @@ class _LoginScreenState extends State<LoginScreen> {
   final _passCtrl = TextEditingController();
   bool _cargando = false;
   bool _esRegistro = false;
+
+  @override
+  void dispose() {
+    _emailCtrl.dispose();
+    _passCtrl.dispose();
+    super.dispose();
+  }
 
   Future<void> _autenticar() async {
     setState(() => _cargando = true);
@@ -2501,12 +2547,12 @@ class _LoginScreenState extends State<LoginScreen> {
               const SizedBox(height: 24),
               TextField(
                 controller: _emailCtrl,
-                decoration: InputDecoration(labelText: 'Correo Electrónico', filled: true, fillColor: Colors.white.withOpacity(0.05), border: OutlineInputBorder(borderRadius: BorderRadius.circular(12))),
+                decoration: InputDecoration(labelText: 'Correo Electrónico', filled: true, fillColor: Colors.white.withValues(alpha: 0.05), border: OutlineInputBorder(borderRadius: BorderRadius.circular(12))),
               ),
               const SizedBox(height: 12),
               TextField(
                 controller: _passCtrl, obscureText: true,
-                decoration: InputDecoration(labelText: 'Contraseña', filled: true, fillColor: Colors.white.withOpacity(0.05), border: OutlineInputBorder(borderRadius: BorderRadius.circular(12))),
+                decoration: InputDecoration(labelText: 'Contraseña', filled: true, fillColor: Colors.white.withValues(alpha: 0.05), border: OutlineInputBorder(borderRadius: BorderRadius.circular(12))),
               ),
               const SizedBox(height: 24),
               _cargando
