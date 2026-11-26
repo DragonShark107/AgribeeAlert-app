@@ -22,3 +22,18 @@ Los avisos los reparte el servidor, que calcula a quién le pilla cerca. Usa sol
 - La Cloud Function de `functions/`, que necesita el plan Blaze: `firebase deploy --only functions`.
 
 Las reglas de seguridad están en `firestore.rules`.
+
+## Verificación de apicultores y aplicadores
+
+- Los vecinos entran directamente.
+- Apicultores y aplicadores envían al registrarse su código REGA o su nº ROPO. Hasta que se aprueba, usan la app como vecinos.
+- Solo los aplicadores verificados pueden publicar avisos. Lo comprueban las reglas de Firestore, no la app.
+
+El administrador revisa las solicitudes con `admin_verificaciones.js`, que usa el mismo `serviceAccountKey.json`:
+
+```
+node admin_verificaciones.js                          # pendientes
+node admin_verificaciones.js aprobar correo@ejemplo.es
+node admin_verificaciones.js rechazar correo@ejemplo.es "motivo"
+node admin_verificaciones.js retirar correo@ejemplo.es "motivo"
+```

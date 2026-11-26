@@ -252,6 +252,135 @@ Future<void> desregistrarDispositivo() async {
   } catch (_) {}
 }
 
+// ---------------------------------------------------------------------------
+// Verificación de profesionales (sustituye al antiguo PIN 1234).
+//
+// - Los vecinos entran directamente, sin verificar nada.
+// - Apicultores y aplicadores envían una solicitud con su nº oficial
+//   (código REGA o nº ROPO) a solicitudes/{uid}.
+// - El administrador la revisa y la aprueba con admin_verificaciones.js, que
+//   pone el rol como "custom claim" en Firebase Auth. Las reglas de Firestore
+//   leen ese rol: solo un aplicador verificado puede crear avisos, aunque
+//   alguien modifique la app.
+// ---------------------------------------------------------------------------
+
+const Map<String, String> kNombresRol = {
+  'vecino': 'Vecino',
+  'apicultor': 'Apicultor',
+  'aplicador': 'Aplicador',
+};
+
+/// Rol verificado del usuario actual ('vecino' si no tiene ninguno).
+/// Con [forzar] se pide un token nuevo a Firebase para ver cambios recientes.
+Future<String> leerRolVerificado({bool forzar = false}) async {
+  final usuario = FirebaseAuth.instance.currentUser;
+  if (usuario == null) return 'vecino';
+  try {
+    final token = await usuario.getIdTokenResult(forzar);
+    final rol = token.claims?['rol'];
+    if (rol == 'apicultor' || rol == 'aplicador') return rol as String;
+  } catch (_) {
+    // Sin conexión no se puede renovar: se usa el token guardado.
+    if (forzar) return leerRolVerificado();
+  }
+  return 'vecino';
+}
+
+/// Devuelve un mensaje de error, o null si los datos son válidos.
+String? validarSolicitudProfesional(String rol, String nombre, String numero) {
+  if (rol == 'vecino') return null;
+  if (nombre.trim().isEmpty) return 'Escribe tu nombre y apellidos.';
+  final n = numero.trim();
+  if (n.length < 4 || n.length > 40) {
+    return rol == 'apicultor'
+        ? 'Escribe el código REGA de tu explotación.'
+        : 'Escribe tu nº ROPO o de carné de aplicador.';
+  }
+  return null;
+}
+
+Future<void> enviarSolicitudVerificacion({
+  required String rol,
+  required String nombre,
+  required String numeroOficial,
+}) {
+  final usuario = FirebaseAuth.instance.currentUser!;
+  // set sin merge: al repetir una solicitud rechazada se borra el motivo anterior.
+  return FirebaseFirestore.instance.collection('solicitudes').doc(usuario.uid).set({
+    'rol': rol,
+    'nombre': nombre.trim(),
+    'numeroOficial': numeroOficial.trim().toUpperCase(),
+    'email': usuario.email ?? '',
+    'estado': 'pendiente',
+    'fecha': FieldValue.serverTimestamp(),
+  });
+}
+
+/// Selector de perfil y, para profesionales, los datos que se revisarán.
+class CamposSolicitudProfesional extends StatelessWidget {
+  const CamposSolicitudProfesional({
+    super.key,
+    required this.rol,
+    required this.alCambiarRol,
+    required this.nombreCtrl,
+    required this.numeroCtrl,
+    this.incluirVecino = true,
+  });
+
+  final String rol;
+  final ValueChanged<String> alCambiarRol;
+  final TextEditingController nombreCtrl;
+  final TextEditingController numeroCtrl;
+  final bool incluirVecino;
+
+  @override
+  Widget build(BuildContext context) {
+    InputDecoration deco(String label, [String? ayuda]) => InputDecoration(
+          labelText: label,
+          helperText: ayuda,
+          helperMaxLines: 2,
+          filled: true,
+          fillColor: Colors.white.withValues(alpha: 0.05),
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+        );
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        SegmentedButton<String>(
+          showSelectedIcon: false,
+          segments: [
+            if (incluirVecino)
+              const ButtonSegment(value: 'vecino', label: Text('Vecino'), icon: Icon(Icons.home_outlined)),
+            const ButtonSegment(value: 'apicultor', label: Text('Apicultor'), icon: Icon(Icons.hive_outlined)),
+            const ButtonSegment(value: 'aplicador', label: Text('Aplicador'), icon: Icon(Icons.agriculture_rounded)),
+          ],
+          selected: {rol},
+          onSelectionChanged: (s) => alCambiarRol(s.first),
+        ),
+        if (rol != 'vecino') ...[
+          const SizedBox(height: 12),
+          TextField(controller: nombreCtrl, textCapitalization: TextCapitalization.words, decoration: deco('Nombre y apellidos')),
+          const SizedBox(height: 12),
+          TextField(
+            controller: numeroCtrl,
+            textCapitalization: TextCapitalization.characters,
+            decoration: rol == 'apicultor'
+                ? deco('Código REGA de la explotación', 'Ej.: ES300000000000')
+                : deco('Nº ROPO / carné de aplicador', 'Aparece en tu carné de productos fitosanitarios'),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'Revisaremos tus datos. Hasta que se aprueben usarás la app en modo vecino.',
+            style: TextStyle(fontSize: 12, color: Colors.white60),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
 /// Guarda la última ubicación conocida para que el servidor pueda avisar
 /// también por cercanía a la posición (no solo a las parcelas).
 void guardarUbicacionUsuario(LatLng posicion) {
@@ -278,7 +407,16 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
   double _radioKm = 4.0;
   bool _cargandoUbicacion = true;
 
-  bool _esModoAgricultor = false;
+  // Rol verificado por el administrador (custom claim de Firebase Auth).
+  // 'vecino' hasta que se apruebe una solicitud. La app no puede cambiarlo.
+  String _rolVerificado = 'vecino';
+  // Un profesional verificado puede pasar a ver la app como vecino.
+  bool _modoProfesional = true;
+  Map<String, dynamic>? _solicitud;
+  StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _suscripcionSolicitud;
+
+  bool get _modoPro => _modoProfesional && _rolVerificado != 'vecino';
+  bool get _puedeEmitir => _modoProfesional && _rolVerificado == 'aplicador';
   int _tipoMapa = 0; // 0: Dark Cyber, 1: Satélite HD, 2: OpenStreetMap
   String _filtroTipo = 'Todos';
   bool _soloActivos = true;
@@ -322,70 +460,134 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
       if (mounted) setState(() {});
     });
 
-    SharedPreferences.getInstance().then((prefs) {
-      if (!mounted) return;
-      if (!prefs.containsKey('es_aplicador')) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) _pedirPinInicial();
-        });
-      } else {
-        setState(() {
-          _esModoAgricultor = prefs.getBool('es_aplicador') ?? false;
-        });
-      }
-    });
-    
+    _cargarRol();
   }
 
-  void _pedirPinInicial() {
+  Future<void> _cargarRol() async {
+    final prefs = await SharedPreferences.getInstance();
+    final rol = await leerRolVerificado(forzar: true);
+    if (!mounted) return;
+    setState(() {
+      _rolVerificado = rol;
+      _modoProfesional = prefs.getBool('modo_profesional_$kUserIdActual') ?? true;
+    });
+
+    // Escucha la solicitud: cuando el administrador la aprueba o retira,
+    // se renueva el token para recoger el nuevo rol sin cerrar sesión.
+    _suscripcionSolicitud = FirebaseFirestore.instance
+        .collection('solicitudes')
+        .doc(kUserIdActual)
+        .snapshots()
+        .listen((doc) async {
+      final datos = doc.data();
+      final estadoAnterior = _solicitud?['estado'];
+      if (!mounted) return;
+      setState(() => _solicitud = datos);
+      final estado = datos?['estado'];
+      final cambiaRol = (estado == 'aprobada' && _rolVerificado == 'vecino') ||
+          (estado == 'retirada' && _rolVerificado != 'vecino');
+      if (!cambiaRol) return;
+      final nuevoRol = await leerRolVerificado(forzar: true);
+      if (!mounted) return;
+      setState(() => _rolVerificado = nuevoRol);
+      if (estadoAnterior == 'pendiente' && nuevoRol != 'vecino') {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          backgroundColor: const Color(0xFF2E7D32),
+          content: Text('Cuenta verificada como ${kNombresRol[nuevoRol]}.'),
+        ));
+      }
+    }, onError: (_) {});
+  }
+
+  Future<void> _cambiarModoProfesional(bool activo) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('modo_profesional_$kUserIdActual', activo);
+    if (mounted) setState(() => _modoProfesional = activo);
+  }
+
+  void _mostrarDialogoSolicitud() {
+    final estado = _solicitud?['estado'];
+    if (estado == 'pendiente') {
+      showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: const Color(0xFF131A20),
+          title: const Text('Verificación pendiente', style: TextStyle(color: Colors.white)),
+          content: Text(
+            'Tu solicitud como ${kNombresRol[_solicitud?['rol']] ?? 'profesional'} '
+            '(nº ${_solicitud?['numeroOficial'] ?? ''}) está pendiente de revisión. '
+            'Mientras tanto puedes usar la app en modo vecino.',
+            style: const TextStyle(color: Colors.white70),
+          ),
+          actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Entendido'))],
+        ),
+      );
+      return;
+    }
+
+    final nombreCtrl = TextEditingController(text: _solicitud?['nombre'] as String? ?? '');
+    final numeroCtrl = TextEditingController();
+    String rol = 'apicultor';
+    bool enviando = false;
+    final motivo = (_solicitud?['motivo'] ?? '').toString();
     showDialog(
       context: context,
-      barrierDismissible: false,
-      builder: (ctx) {
-        final TextEditingController pinController = TextEditingController();
-        return AlertDialog(
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
           backgroundColor: const Color(0xFF131A20),
-          title: const Text('Configuración de Perfil', style: TextStyle(color: Colors.white)),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Text('Si eres técnico aplicador, introduce tu PIN. Si eres un vecino, continúa directamente.', style: TextStyle(color: Colors.white70, fontSize: 13)),
-              const SizedBox(height: 12),
-              TextField(
-                controller: pinController, keyboardType: TextInputType.number, obscureText: true, style: const TextStyle(color: Colors.white),
-                decoration: const InputDecoration(labelText: 'Nº Carné / PIN', labelStyle: TextStyle(color: Colors.white54)),
-              ),
-            ],
+          title: const Text('Verificar cuenta profesional', style: TextStyle(color: Colors.white)),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (estado == 'rechazada' || estado == 'retirada')
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 12),
+                    child: Text(
+                      'Tu solicitud anterior fue ${estado == 'rechazada' ? 'rechazada' : 'retirada'}'
+                      '${motivo.isNotEmpty ? ': $motivo' : '.'}',
+                      style: const TextStyle(color: Colors.orangeAccent, fontSize: 13),
+                    ),
+                  ),
+                CamposSolicitudProfesional(
+                  rol: rol,
+                  incluirVecino: false,
+                  alCambiarRol: (r) => setDialogState(() => rol = r),
+                  nombreCtrl: nombreCtrl,
+                  numeroCtrl: numeroCtrl,
+                ),
+              ],
+            ),
           ),
           actions: [
-            TextButton(
-              onPressed: () async {
-                final prefs = await SharedPreferences.getInstance();
-                await prefs.setBool('es_aplicador', false);
-                if (!mounted) return;
-                setState(() => _esModoAgricultor = false);
-                if (ctx.mounted) Navigator.pop(ctx);
-              },
-              child: const Text('No soy técnico (Modo Vecino)', style: TextStyle(color: Colors.white54)),
-            ),
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancelar', style: TextStyle(color: Colors.white54))),
             ElevatedButton(
               style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00E676)),
-              onPressed: () async {
-                if (pinController.text == '1234') {
-                  final prefs = await SharedPreferences.getInstance();
-                  await prefs.setBool('es_aplicador', true);
-                  if (!mounted) return;
-                  setState(() => _esModoAgricultor = true);
-                  if (ctx.mounted) Navigator.pop(ctx);
-                } else {
-                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('PIN incorrecto'), backgroundColor: Colors.redAccent));
-                }
-              },
-              child: const Text('Acceso Técnico', style: TextStyle(color: Colors.black)),
+              onPressed: enviando
+                  ? null
+                  : () async {
+                      final messenger = ScaffoldMessenger.of(context);
+                      final error = validarSolicitudProfesional(rol, nombreCtrl.text, numeroCtrl.text);
+                      if (error != null) {
+                        messenger.showSnackBar(SnackBar(content: Text(error), backgroundColor: Colors.redAccent));
+                        return;
+                      }
+                      setDialogState(() => enviando = true);
+                      try {
+                        await enviarSolicitudVerificacion(rol: rol, nombre: nombreCtrl.text, numeroOficial: numeroCtrl.text);
+                        if (ctx.mounted) Navigator.pop(ctx);
+                        messenger.showSnackBar(const SnackBar(content: Text('Solicitud enviada. Te avisaremos al revisarla.')));
+                      } catch (e) {
+                        if (ctx.mounted) setDialogState(() => enviando = false);
+                        messenger.showSnackBar(SnackBar(content: Text('No se pudo enviar: $e'), backgroundColor: Colors.redAccent));
+                      }
+                    },
+              child: const Text('Enviar solicitud', style: TextStyle(color: Colors.black)),
             ),
           ],
-        );
-      },
+        ),
+      ),
     );
   }
 
@@ -417,6 +619,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
   @override
   void dispose() {
     _suscripcionPosicion?.cancel();
+    _suscripcionSolicitud?.cancel();
     _relojRefresco?.cancel();
     ubicacionNotificacionSeleccionada.removeListener(_onNotificacionPulsada);
     _searchController.dispose();
@@ -1706,7 +1909,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                       ],
                     ),
                   ),
-                  if (_esModoAgricultor && data['creatorUid'] == kUserIdActual)
+                  if (_puedeEmitir && data['creatorUid'] == kUserIdActual)
                     IconButton(
                       icon: const Icon(Icons.delete_outline, color: Colors.white54),
                       onPressed: () async {
@@ -1795,7 +1998,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                       initialCenter: _posicionSeleccionada,
                       initialZoom: 11.5,
                       onTap: (tapPosition, point) {
-                        if (_esModoAgricultor) setState(() => _posicionSeleccionada = point);
+                        if (_puedeEmitir) setState(() => _posicionSeleccionada = point);
                       },
                       onLongPress: (tapPosition, point) => _mostrarDialogoParcela(coordenadas: point),
                     ),
@@ -1954,7 +2157,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                                   CircleLayer(
                                     circles: [
                                       ...circulosGuardados,
-                                      if (_esModoAgricultor)
+                                      if (_puedeEmitir)
                                         CircleMarker(
                                           point: _posicionSeleccionada, color: const Color(0xFF00E676).withValues(alpha: 0.2),
                                           borderColor: const Color(0xFF00E676), borderStrokeWidth: 2,
@@ -1969,7 +2172,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                                           point: _miUbicacionReal!, width: 24, height: 24,
                                           child: IgnorePointer(child: Container(decoration: BoxDecoration(color: const Color(0xFF00E5FF), shape: BoxShape.circle, border: Border.all(color: Colors.white, width: 3), boxShadow: [BoxShadow(color: const Color(0xFF00E5FF).withValues(alpha: 0.8), blurRadius: 10)]))),
                                         ),
-                                      if (_esModoAgricultor)
+                                      if (_puedeEmitir)
                                         Marker(
                                           point: _posicionSeleccionada, width: 44, height: 44,
                                           child: const IgnorePointer(child: Icon(Icons.location_on, color: Color(0xFF00E676), size: 44)),
@@ -2010,9 +2213,14 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                           Expanded(
                             child: Row(
                               children: [
-                                Container(width: 8, height: 8, decoration: BoxDecoration(color: _esModoAgricultor ? const Color(0xFF00E676) : const Color(0xFF00E5FF), shape: BoxShape.circle)),
+                                Container(width: 8, height: 8, decoration: BoxDecoration(color: _modoPro ? const Color(0xFF00E676) : const Color(0xFF00E5FF), shape: BoxShape.circle)),
                                 const SizedBox(width: 8),
-                                Flexible(child: Text(_esModoAgricultor ? 'APLICADOR' : 'VECINO', overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1.1, color: Colors.white))),
+                                Flexible(child: Text(_modoPro ? kNombresRol[_rolVerificado]!.toUpperCase() : 'VECINO', overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1.1, color: Colors.white))),
+                                // Distintivo de cuenta profesional verificada por el administrador.
+                                if (_modoPro) ...[
+                                  const SizedBox(width: 4),
+                                  const Tooltip(message: 'Cuenta verificada', child: Icon(Icons.verified_rounded, size: 15, color: Color(0xFF00E676))),
+                                ],
                                 const SizedBox(width: 6),
                                 Container(
                                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
@@ -2032,56 +2240,21 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                           },
                         ),
                         PopupMenuButton<String>(
-                          icon: Icon(_esModoAgricultor ? Icons.person_outline : Icons.agriculture_rounded, size: 22, color: Colors.white),
+                          icon: Icon(_modoPro ? Icons.person_outline : Icons.agriculture_rounded, size: 22, color: Colors.white),
                           color: const Color(0xFF131A20),
                           tooltip: 'Opciones de Cuenta',
                           offset: const Offset(0, 40),
                           onSelected: (val) async {
                             if (val == 'cambiar_rol') {
-                              if (_esModoAgricultor) {
-                                // De Aplicador a Vecino (sin contraseña)
-                                final prefs = await SharedPreferences.getInstance();
-                                await prefs.setBool('es_aplicador', false);
-                                if (mounted) setState(() => _esModoAgricultor = false);
+                              if (_rolVerificado != 'vecino') {
+                                // Profesional verificado: alterna entre su modo y el de vecino.
+                                await _cambiarModoProfesional(!_modoProfesional);
                               } else {
-                                // De Vecino a Aplicador (Pide PIN)
-                                showDialog(
-                                  context: context,
-                                  builder: (ctx) {
-                                    final TextEditingController pinController = TextEditingController();
-                                    return AlertDialog(
-                                      backgroundColor: const Color(0xFF131A20),
-                                      title: const Text('Acceso Técnico', style: TextStyle(color: Colors.white)),
-                                      content: TextField(
-                                        controller: pinController, keyboardType: TextInputType.number, obscureText: true, style: const TextStyle(color: Colors.white),
-                                        decoration: const InputDecoration(labelText: 'Nº Carné / PIN', labelStyle: TextStyle(color: Colors.white54)),
-                                      ),
-                                      actions: [
-                                        TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancelar', style: TextStyle(color: Colors.white54))),
-                                        ElevatedButton(
-                                          style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00E676)),
-                                          onPressed: () async {
-                                            if (pinController.text == '1234') {
-                                              final prefs = await SharedPreferences.getInstance();
-                                              await prefs.setBool('es_aplicador', true);
-                                              if (!mounted) return;
-                                              setState(() => _esModoAgricultor = true);
-                                              if (ctx.mounted) Navigator.pop(ctx);
-                                            } else {
-                                              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('PIN incorrecto'), backgroundColor: Colors.redAccent));
-                                            }
-                                          },
-                                          child: const Text('Verificar', style: TextStyle(color: Colors.black)),
-                                        ),
-                                      ],
-                                    );
-                                  },
-                                );
+                                // Sin verificar: enviar (o consultar) la solicitud.
+                                _mostrarDialogoSolicitud();
                               }
                             } else if (val == 'logout') {
                               // Cerrar Sesión
-                              final prefs = await SharedPreferences.getInstance();
-                              await prefs.remove('es_aplicador');
                               await desregistrarDispositivo();
                               await FirebaseAuth.instance.signOut();
                             }
@@ -2091,9 +2264,14 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                               value: 'cambiar_rol',
                               child: Row(
                                 children: [
-                                  Icon(_esModoAgricultor ? Icons.person_outline : Icons.agriculture_rounded, size: 18, color: Colors.white),
+                                  Icon(_modoPro ? Icons.person_outline : Icons.verified_user_outlined, size: 18, color: Colors.white),
                                   const SizedBox(width: 10),
-                                  Text(_esModoAgricultor ? 'Cambiar a Vecino' : 'Acceso Técnico', style: const TextStyle(color: Colors.white)),
+                                  Text(
+                                    _rolVerificado != 'vecino'
+                                        ? (_modoProfesional ? 'Cambiar a Vecino' : 'Modo ${kNombresRol[_rolVerificado]}')
+                                        : (_solicitud?['estado'] == 'pendiente' ? 'Verificación pendiente' : 'Soy apicultor / aplicador'),
+                                    style: const TextStyle(color: Colors.white),
+                                  ),
                                 ],
                               ),
                             ),
@@ -2146,9 +2324,9 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                     ),
                   ),
 
-                if (_esModoAgricultor)
+                if (_modoPro)
                   Positioned(
-                    left: 14, bottom: 200,
+                    left: 14, bottom: _puedeEmitir ? 200 : 32,
                     child: InkWell(
                       onTap: _mostrarMenuParcelas, borderRadius: BorderRadius.circular(20),
                       child: _glassContainer(
@@ -2159,7 +2337,7 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                   ),
 
                 Positioned(
-                  right: 14, bottom: _esModoAgricultor ? 210 : 32,
+                  right: 14, bottom: _puedeEmitir ? 210 : 32,
                   child: Column(
                     children: [
                      _glassContainer(
@@ -2213,7 +2391,7 @@ _glassContainer(
                   ),
                 ),
 
-                if (_esModoAgricultor)
+                if (_puedeEmitir)
                   Positioned(
                     bottom: 20, left: 14, right: 14,
                     child: SafeArea(
@@ -2507,22 +2685,44 @@ class LoginScreen extends StatefulWidget {
 class _LoginScreenState extends State<LoginScreen> {
   final _emailCtrl = TextEditingController();
   final _passCtrl = TextEditingController();
+  final _nombreCtrl = TextEditingController();
+  final _numeroCtrl = TextEditingController();
   bool _cargando = false;
   bool _esRegistro = false;
+  String _rol = 'vecino';
 
   @override
   void dispose() {
     _emailCtrl.dispose();
     _passCtrl.dispose();
+    _nombreCtrl.dispose();
+    _numeroCtrl.dispose();
     super.dispose();
   }
 
   Future<void> _autenticar() async {
+    final messenger = ScaffoldMessenger.of(context);
+    if (_esRegistro) {
+      final error = validarSolicitudProfesional(_rol, _nombreCtrl.text, _numeroCtrl.text);
+      if (error != null) {
+        messenger.showSnackBar(SnackBar(content: Text(error), backgroundColor: Colors.redAccent));
+        return;
+      }
+    }
     setState(() => _cargando = true);
     try {
       if (_esRegistro) {
         await FirebaseAuth.instance.createUserWithEmailAndPassword(
             email: _emailCtrl.text.trim(), password: _passCtrl.text.trim());
+        // Los vecinos entran sin más; los profesionales dejan su solicitud.
+        if (_rol != 'vecino') {
+          try {
+            await enviarSolicitudVerificacion(rol: _rol, nombre: _nombreCtrl.text, numeroOficial: _numeroCtrl.text);
+            messenger.showSnackBar(const SnackBar(content: Text('Cuenta creada. Tu solicitud de verificación está pendiente.')));
+          } catch (_) {
+            messenger.showSnackBar(const SnackBar(content: Text('Cuenta creada, pero no se pudo enviar la solicitud. Repítela desde el menú de cuenta.')));
+          }
+        }
       } else {
         await FirebaseAuth.instance.signInWithEmailAndPassword(
             email: _emailCtrl.text.trim(), password: _passCtrl.text.trim());
@@ -2538,7 +2738,7 @@ class _LoginScreenState extends State<LoginScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       body: Center(
-        child: Padding(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.all(24.0),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
@@ -2554,6 +2754,17 @@ class _LoginScreenState extends State<LoginScreen> {
                 controller: _passCtrl, obscureText: true,
                 decoration: InputDecoration(labelText: 'Contraseña', filled: true, fillColor: Colors.white.withValues(alpha: 0.05), border: OutlineInputBorder(borderRadius: BorderRadius.circular(12))),
               ),
+              if (_esRegistro) ...[
+                const SizedBox(height: 20),
+                const Align(alignment: Alignment.centerLeft, child: Text('¿Cómo vas a usar la app?', style: TextStyle(fontWeight: FontWeight.bold))),
+                const SizedBox(height: 8),
+                CamposSolicitudProfesional(
+                  rol: _rol,
+                  alCambiarRol: (r) => setState(() => _rol = r),
+                  nombreCtrl: _nombreCtrl,
+                  numeroCtrl: _numeroCtrl,
+                ),
+              ],
               const SizedBox(height: 24),
               _cargando
                   ? const CircularProgressIndicator(color: Color(0xFF00E676))

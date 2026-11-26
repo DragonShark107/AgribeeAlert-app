@@ -19,5 +19,26 @@ void main() {
     await tester.pump();
 
     expect(find.text('Registrarse'), findsOneWidget);
+
+    // Vecino por defecto: no pide datos profesionales.
+    expect(find.text('Código REGA de la explotación'), findsNothing);
+
+    // Apicultor: pide nombre y código REGA.
+    await tester.tap(find.text('Apicultor'));
+    await tester.pump();
+    expect(find.text('Nombre y apellidos'), findsOneWidget);
+    expect(find.text('Código REGA de la explotación'), findsOneWidget);
+
+    // Sin datos no deja registrarse como profesional.
+    await tester.ensureVisible(find.text('Registrarse'));
+    await tester.tap(find.text('Registrarse'));
+    await tester.pump();
+    expect(find.text('Escribe tu nombre y apellidos.'), findsOneWidget);
+  });
+
+  test('Validación de la solicitud profesional', () {
+    expect(validarSolicitudProfesional('vecino', '', ''), isNull);
+    expect(validarSolicitudProfesional('apicultor', 'Ana', 'ES12'), isNull);
+    expect(validarSolicitudProfesional('aplicador', 'Ana', '12'), isNotNull);
   });
 }
