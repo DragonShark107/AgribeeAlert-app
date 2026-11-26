@@ -15,10 +15,18 @@ service cloud.firestore {
       return request.auth != null;
     }
 
-    // Rol verificado: lo pone el administrador con admin_verificaciones.js
-    // (custom claim de Firebase Auth). Un usuario no puede ponérselo a sí mismo.
+    // Administradores: los que tienen un documento en admins/{uid}.
+    // Esa colección no se puede escribir desde la app (solo desde la consola
+    // de Firebase o admin_verificaciones.js).
+    function esAdmin() {
+      return autenticado() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    // Rol verificado: roles/{uid}, que solo un administrador puede escribir
+    // (desde el panel de verificación de la app). Sin documento = vecino.
     function rol() {
-      return request.auth.token.get('rol', 'vecino');
+      let ruta = /databases/$(database)/documents/roles/$(request.auth.uid);
+      return exists(ruta) ? get(ruta).data.rol : 'vecino';
     }
 
     function esCoordenada(lat, lng) {
@@ -103,7 +111,7 @@ service cloud.firestore {
     // ------------------------------------------------------------------
     // Solicitudes de verificación de apicultores y aplicadores.
     // El usuario solo puede enviar la suya en estado "pendiente"; aprobarla,
-    // rechazarla o retirarla lo hace el administrador desde el servidor.
+    // rechazarla o retirarla lo hace un administrador desde la app.
     // ------------------------------------------------------------------
     match /solicitudes/{uid} {
       function solicitudValida() {
@@ -117,12 +125,35 @@ service cloud.firestore {
           && d.fecha == request.time;
       }
 
-      allow read: if autenticado() && request.auth.uid == uid;
+      allow read: if (autenticado() && request.auth.uid == uid) || esAdmin();
       allow create: if autenticado() && request.auth.uid == uid && solicitudValida();
-      // Solo se puede repetir una solicitud rechazada o retirada.
-      allow update: if autenticado() && request.auth.uid == uid
-        && resource.data.estado in ['rechazada', 'retirada']
-        && solicitudValida();
+      // El usuario solo puede repetir una solicitud rechazada o retirada.
+      // El administrador solo cambia el estado, el motivo y la fecha de revisión.
+      allow update: if (autenticado() && request.auth.uid == uid
+          && resource.data.estado in ['rechazada', 'retirada']
+          && solicitudValida())
+        || (esAdmin()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['estado', 'motivo', 'fechaRevision'])
+          && request.resource.data.estado in ['aprobada', 'rechazada', 'retirada']
+          && request.resource.data.get('motivo', '') is string
+          && request.resource.data.get('motivo', '').size() <= 300);
+    }
+
+    // ------------------------------------------------------------------
+    // Roles verificados. Cada usuario lee el suyo; solo los administradores
+    // los conceden o retiran.
+    // ------------------------------------------------------------------
+    match /roles/{uid} {
+      allow read: if (autenticado() && request.auth.uid == uid) || esAdmin();
+      allow create, update: if esAdmin()
+        && request.resource.data.rol in ['apicultor', 'aplicador'];
+      allow delete: if esAdmin();
+    }
+
+    // Lista de administradores: cada uno puede ver si lo es, nadie la cambia desde la app.
+    match /admins/{uid} {
+      allow read: if autenticado() && request.auth.uid == uid;
+      allow write: if false;
     }
 
     // Todo lo demás, denegado.

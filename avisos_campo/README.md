@@ -29,11 +29,12 @@ Las reglas de seguridad están en `firestore.rules`.
 - Apicultores y aplicadores envían al registrarse su código REGA o su nº ROPO. Hasta que se aprueba, usan la app como vecinos.
 - Solo los aplicadores verificados pueden publicar avisos. Lo comprueban las reglas de Firestore, no la app.
 
-El administrador revisa las solicitudes con `admin_verificaciones.js`, que usa el mismo `serviceAccountKey.json`:
+Las solicitudes se aprueban o rechazan **desde la app**: menú de cuenta → **Panel de verificación**, que solo ven los administradores. Con el servidor en marcha:
+- al administrador le llega una notificación con cada solicitud nueva;
+- al usuario le llega otra cuando se aprueba o rechaza la suya.
+
+Para nombrar al primer administrador, solo una vez:
 
 ```
-node admin_verificaciones.js                          # pendientes
-node admin_verificaciones.js aprobar correo@ejemplo.es
-node admin_verificaciones.js rechazar correo@ejemplo.es "motivo"
-node admin_verificaciones.js retirar correo@ejemplo.es "motivo"
+node admin_verificaciones.js admin correo@ejemplo.es
 ```

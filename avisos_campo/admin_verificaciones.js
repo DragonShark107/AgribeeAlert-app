@@ -1,22 +1,19 @@
-// Herramienta del administrador para verificar apicultores y aplicadores.
-// Usa la misma clave que el servidor (serviceAccountKey.json, que no se sube a GitHub).
+// Herramienta del administrador. Lo normal es aprobar o rechazar desde la app
+// (menú de cuenta > "Panel de verificación"); este script solo hace falta UNA VEZ,
+// para nombrar al primer administrador. Usa serviceAccountKey.json (no se sube a GitHub).
 //
+//   node admin_verificaciones.js admin CORREO        -> hace administrador a esa cuenta
+//   node admin_verificaciones.js quitar-admin CORREO
+//
+// Opcional, por si no tienes el móvil a mano:
 //   node admin_verificaciones.js                     -> lista las solicitudes pendientes
-//   node admin_verificaciones.js todas               -> lista todas las solicitudes
-//   node admin_verificaciones.js aprobar CORREO      -> verifica la cuenta con el rol que pidió
-//   node admin_verificaciones.js aprobar CORREO aplicador  -> verifica con otro rol
+//   node admin_verificaciones.js aprobar CORREO
 //   node admin_verificaciones.js rechazar CORREO "motivo"
-//   node admin_verificaciones.js retirar CORREO "motivo"   -> quita la verificación
-//
-// Comprueba el número antes de aprobar:
-//   - Código REGA (apicultores): pídele el justificante de su explotación o consúltalo en su comunidad autónoma.
-//   - Nº ROPO (aplicadores): https://www.mapa.gob.es/es/agricultura/temas/sanidad-vegetal/ropo/
+//   node admin_verificaciones.js retirar CORREO "motivo"
 
 const { initializeApp, cert } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
-
-const ROLES = ["apicultor", "aplicador"];
 
 function iniciar() {
   let serviceAccount;
@@ -30,85 +27,73 @@ function iniciar() {
   return { auth: getAuth(), db: getFirestore() };
 }
 
-async function buscarUsuario(auth, correoOUid) {
+async function buscarUsuario(auth, correo) {
   try {
-    return correoOUid.includes("@") ? await auth.getUserByEmail(correoOUid) : await auth.getUser(correoOUid);
+    return correo.includes("@") ? await auth.getUserByEmail(correo) : await auth.getUser(correo);
   } catch {
-    throw new Error(`No existe ninguna cuenta con "${correoOUid}".`);
+    throw new Error(`No existe ninguna cuenta con "${correo}". Regístrate antes en la app.`);
   }
-}
-
-async function listar(db, soloPendientes) {
-  let consulta = db.collection("solicitudes");
-  if (soloPendientes) consulta = consulta.where("estado", "==", "pendiente");
-  const snap = await consulta.get();
-  if (snap.empty) {
-    console.log(soloPendientes ? "No hay solicitudes pendientes." : "No hay solicitudes.");
-    return;
-  }
-  for (const doc of snap.docs) {
-    const s = doc.data();
-    const fecha = s.fecha ? s.fecha.toDate().toLocaleString("es-ES") : "-";
-    console.log(`\n[${s.estado}] ${s.email}`);
-    console.log(`  Nombre: ${s.nombre}`);
-    console.log(`  Rol pedido: ${s.rol}   Nº oficial: ${s.numeroOficial}`);
-    console.log(`  Fecha: ${fecha}`);
-    if (s.motivo) console.log(`  Motivo: ${s.motivo}`);
-  }
-  console.log(`\nTotal: ${snap.size}`);
-}
-
-async function aprobar(auth, db, correo, rolForzado) {
-  const usuario = await buscarUsuario(auth, correo);
-  const ref = db.collection("solicitudes").doc(usuario.uid);
-  const solicitud = (await ref.get()).data();
-  const rol = rolForzado || (solicitud && solicitud.rol);
-  if (!ROLES.includes(rol)) {
-    throw new Error(`Indica el rol: node admin_verificaciones.js aprobar ${correo} apicultor|aplicador`);
-  }
-  // Primero el rol (lo que de verdad comprueban las reglas) y después la
-  // solicitud: la app, al ver "aprobada", renueva el token y recoge el rol.
-  await auth.setCustomUserClaims(usuario.uid, { ...(usuario.customClaims || {}), rol });
-  await ref.set(
-    { estado: "aprobada", rol, fechaRevision: FieldValue.serverTimestamp(), motivo: FieldValue.delete() },
-    { merge: true },
-  );
-  console.log(`✅ ${usuario.email} verificado como ${rol}.`);
-}
-
-async function cambiarEstado(auth, db, correo, estado, motivo) {
-  const usuario = await buscarUsuario(auth, correo);
-  if (estado === "retirada") {
-    const { rol, ...resto } = usuario.customClaims || {};
-    await auth.setCustomUserClaims(usuario.uid, resto);
-    // Cierra sus sesiones para que pierda el permiso enseguida (no al cabo de una hora).
-    await auth.revokeRefreshTokens(usuario.uid);
-  }
-  await db.collection("solicitudes").doc(usuario.uid).set(
-    { estado, motivo: motivo || "", fechaRevision: FieldValue.serverTimestamp() },
-    { merge: true },
-  );
-  console.log(`${estado === "retirada" ? "⛔ Verificación retirada a" : "❌ Solicitud rechazada:"} ${usuario.email}.`);
 }
 
 async function main() {
   const [accion = "pendientes", correo, extra] = process.argv.slice(2);
   const { auth, db } = iniciar();
+  const necesitaCorreo = () => {
+    if (!correo) throw new Error(`Falta el correo: node admin_verificaciones.js ${accion} CORREO`);
+  };
 
   switch (accion) {
-    case "pendientes":
-      return listar(db, true);
-    case "todas":
-      return listar(db, false);
-    case "aprobar":
-      if (!correo) throw new Error("Uso: node admin_verificaciones.js aprobar CORREO [apicultor|aplicador]");
-      return aprobar(auth, db, correo, extra);
+    case "admin": {
+      necesitaCorreo();
+      const u = await buscarUsuario(auth, correo);
+      await db.collection("admins").doc(u.uid).set({ email: u.email, fecha: FieldValue.serverTimestamp() });
+      console.log(`✅ ${u.email} ya es administrador. Abre la app: en el menú de cuenta verás "Panel de verificación".`);
+      return;
+    }
+    case "quitar-admin": {
+      necesitaCorreo();
+      const u = await buscarUsuario(auth, correo);
+      await db.collection("admins").doc(u.uid).delete();
+      console.log(`${u.email} ya no es administrador.`);
+      return;
+    }
+    case "pendientes": {
+      const snap = await db.collection("solicitudes").where("estado", "==", "pendiente").get();
+      if (snap.empty) return console.log("No hay solicitudes pendientes.");
+      snap.forEach((d) => {
+        const s = d.data();
+        console.log(`\n${s.email}\n  ${s.nombre} - ${s.rol} - nº ${s.numeroOficial}`);
+      });
+      return;
+    }
+    case "aprobar": {
+      necesitaCorreo();
+      const u = await buscarUsuario(auth, correo);
+      const ref = db.collection("solicitudes").doc(u.uid);
+      const s = (await ref.get()).data();
+      if (!s) throw new Error(`${u.email} no ha enviado ninguna solicitud.`);
+      await db.collection("roles").doc(u.uid).set({
+        rol: s.rol, nombre: s.nombre, email: s.email, numeroOficial: s.numeroOficial,
+        aprobadoPor: "terminal", fecha: FieldValue.serverTimestamp(),
+      });
+      await ref.update({ estado: "aprobada", motivo: "", fechaRevision: FieldValue.serverTimestamp() });
+      console.log(`✅ ${u.email} verificado como ${s.rol}.`);
+      return;
+    }
     case "rechazar":
-    case "retirar":
-      if (!correo) throw new Error(`Uso: node admin_verificaciones.js ${accion} CORREO "motivo"`);
-      return cambiarEstado(auth, db, correo, accion === "rechazar" ? "rechazada" : "retirada", extra);
+    case "retirar": {
+      necesitaCorreo();
+      const u = await buscarUsuario(auth, correo);
+      if (accion === "retirar") await db.collection("roles").doc(u.uid).delete();
+      await db.collection("solicitudes").doc(u.uid).set(
+        { estado: accion === "rechazar" ? "rechazada" : "retirada", motivo: extra || "", fechaRevision: FieldValue.serverTimestamp() },
+        { merge: true },
+      );
+      console.log(`Hecho: ${u.email} (${accion}).`);
+      return;
+    }
     default:
-      throw new Error(`Acción desconocida "${accion}". Usa: pendientes, todas, aprobar, rechazar o retirar.`);
+      throw new Error(`Acción desconocida "${accion}". Usa: admin, quitar-admin, pendientes, aprobar, rechazar o retirar.`);
   }
 }
 

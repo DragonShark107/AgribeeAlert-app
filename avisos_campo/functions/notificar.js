@@ -117,6 +117,15 @@ async function notificarAviso({ db, messaging, FieldValue, avisoId, aviso }) {
   }
   if (mensajes.length === 0) return { usuarios: afectados.size, enviados: 0, fallidos: 0 };
 
+  const { enviados, fallidos } = await enviarMensajes(db, messaging, FieldValue, mensajes, origen);
+  return { usuarios: afectados.size, enviados, fallidos };
+}
+
+/**
+ * Envía los mensajes en lotes y quita de usuarios/{uid}.fcmTokens los tokens
+ * de móviles que ya no existen. `origen[i]` es [uid, token] del mensaje i.
+ */
+async function enviarMensajes(db, messaging, FieldValue, mensajes, origen) {
   let enviados = 0;
   let fallidos = 0;
   const caducados = [];
@@ -142,8 +151,64 @@ async function notificarAviso({ db, messaging, FieldValue, avisoId, aviso }) {
       }).catch(() => {})
     )
   );
-
-  return { usuarios: afectados.size, enviados, fallidos };
+  return { enviados, fallidos };
 }
 
-module.exports = { notificarAviso, calcularDestinatarios, distanciaMetros };
+/** Envía una notificación sencilla a todos los móviles de los usuarios `uids`. */
+async function notificarUsuarios({ db, messaging, FieldValue, uids, titulo, cuerpo, data = {}, tag }) {
+  const mensajes = [];
+  const origen = [];
+  const docs = await Promise.all(uids.map((uid) => db.collection("usuarios").doc(uid).get()));
+  for (const d of docs) {
+    for (const token of d.exists ? d.data().fcmTokens || [] : []) {
+      mensajes.push({
+        token,
+        notification: { title: titulo, body: cuerpo },
+        data,
+        android: { priority: "high", notification: { channelId: "avisos_campo_channel", ...(tag ? { tag } : {}) } },
+        apns: { headers: { "apns-priority": "10" }, payload: { aps: { sound: "default" } } },
+      });
+      origen.push([d.id, token]);
+    }
+  }
+  if (mensajes.length === 0) return { enviados: 0, fallidos: 0 };
+  return enviarMensajes(db, messaging, FieldValue, mensajes, origen);
+}
+
+const NOMBRE_ROL = { apicultor: "apicultor", aplicador: "aplicador" };
+
+/**
+ * Avisa de los cambios en una solicitud de verificación:
+ * - nueva (o repetida) -> a los administradores, para que la revisen en la app;
+ * - aprobada / rechazada / retirada -> al propio solicitante.
+ * `antes` y `despues` son los datos del documento (o undefined).
+ */
+async function notificarSolicitud({ db, messaging, FieldValue, uid, antes, despues }) {
+  if (!despues || despues.estado === antes?.estado) return null;
+  const rol = NOMBRE_ROL[despues.rol] || "profesional";
+  const motivo = despues.motivo ? ` Motivo: ${despues.motivo}` : "";
+  const base = { db, messaging, FieldValue, data: { tipo: "solicitud" }, tag: `solicitud-${uid}` };
+
+  switch (despues.estado) {
+    case "pendiente": {
+      const admins = (await db.collection("admins").get()).docs.map((d) => d.id);
+      if (admins.length === 0) return null;
+      return notificarUsuarios({
+        ...base,
+        uids: admins,
+        titulo: "🐝 Nueva solicitud de verificación",
+        cuerpo: `${despues.nombre || despues.email} quiere verificarse como ${rol}. Revísala en el panel de verificación.`,
+      });
+    }
+    case "aprobada":
+      return notificarUsuarios({ ...base, uids: [uid], titulo: "✅ Cuenta verificada", cuerpo: `Ya puedes usar Agribee Alert como ${rol}.` });
+    case "rechazada":
+      return notificarUsuarios({ ...base, uids: [uid], titulo: "Solicitud de verificación rechazada", cuerpo: `No se ha podido verificar tu cuenta.${motivo}` });
+    case "retirada":
+      return notificarUsuarios({ ...base, uids: [uid], titulo: "Verificación retirada", cuerpo: `Tu cuenta vuelve al modo vecino.${motivo}` });
+    default:
+      return null;
+  }
+}
+
+module.exports = { notificarAviso, notificarSolicitud, notificarUsuarios, calcularDestinatarios, distanciaMetros };

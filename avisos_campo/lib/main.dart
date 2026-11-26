@@ -258,10 +258,10 @@ Future<void> desregistrarDispositivo() async {
 // - Los vecinos entran directamente, sin verificar nada.
 // - Apicultores y aplicadores envían una solicitud con su nº oficial
 //   (código REGA o nº ROPO) a solicitudes/{uid}.
-// - El administrador la revisa y la aprueba con admin_verificaciones.js, que
-//   pone el rol como "custom claim" en Firebase Auth. Las reglas de Firestore
-//   leen ese rol: solo un aplicador verificado puede crear avisos, aunque
-//   alguien modifique la app.
+// - Un administrador (documento admins/{uid}) la revisa en el "Panel de
+//   verificación" de la app y pulsa Aprobar o Rechazar. Al aprobar se crea
+//   roles/{uid}. Las reglas de Firestore leen ese rol: solo un aplicador
+//   verificado puede crear avisos, aunque alguien modifique la app.
 // ---------------------------------------------------------------------------
 
 const Map<String, String> kNombresRol = {
@@ -269,22 +269,6 @@ const Map<String, String> kNombresRol = {
   'apicultor': 'Apicultor',
   'aplicador': 'Aplicador',
 };
-
-/// Rol verificado del usuario actual ('vecino' si no tiene ninguno).
-/// Con [forzar] se pide un token nuevo a Firebase para ver cambios recientes.
-Future<String> leerRolVerificado({bool forzar = false}) async {
-  final usuario = FirebaseAuth.instance.currentUser;
-  if (usuario == null) return 'vecino';
-  try {
-    final token = await usuario.getIdTokenResult(forzar);
-    final rol = token.claims?['rol'];
-    if (rol == 'apicultor' || rol == 'aplicador') return rol as String;
-  } catch (_) {
-    // Sin conexión no se puede renovar: se usa el token guardado.
-    if (forzar) return leerRolVerificado();
-  }
-  return 'vecino';
-}
 
 /// Devuelve un mensaje de error, o null si los datos son válidos.
 String? validarSolicitudProfesional(String rol, String nombre, String numero) {
@@ -407,13 +391,14 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
   double _radioKm = 4.0;
   bool _cargandoUbicacion = true;
 
-  // Rol verificado por el administrador (custom claim de Firebase Auth).
+  // Rol verificado por un administrador (documento roles/{uid}).
   // 'vecino' hasta que se apruebe una solicitud. La app no puede cambiarlo.
   String _rolVerificado = 'vecino';
   // Un profesional verificado puede pasar a ver la app como vecino.
   bool _modoProfesional = true;
+  bool _esAdmin = false;
   Map<String, dynamic>? _solicitud;
-  StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _suscripcionSolicitud;
+  final List<StreamSubscription> _suscripcionesCuenta = [];
 
   bool get _modoPro => _modoProfesional && _rolVerificado != 'vecino';
   bool get _puedeEmitir => _modoProfesional && _rolVerificado == 'aplicador';
@@ -465,38 +450,34 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
 
   Future<void> _cargarRol() async {
     final prefs = await SharedPreferences.getInstance();
-    final rol = await leerRolVerificado(forzar: true);
     if (!mounted) return;
-    setState(() {
-      _rolVerificado = rol;
-      _modoProfesional = prefs.getBool('modo_profesional_$kUserIdActual') ?? true;
-    });
+    setState(() => _modoProfesional = prefs.getBool('modo_profesional_$kUserIdActual') ?? true);
 
-    // Escucha la solicitud: cuando el administrador la aprueba o retira,
-    // se renueva el token para recoger el nuevo rol sin cerrar sesión.
-    _suscripcionSolicitud = FirebaseFirestore.instance
-        .collection('solicitudes')
-        .doc(kUserIdActual)
-        .snapshots()
-        .listen((doc) async {
-      final datos = doc.data();
-      final estadoAnterior = _solicitud?['estado'];
+    final db = FirebaseFirestore.instance;
+    bool primeraLectura = true;
+    // Rol verificado: cambia en directo cuando un administrador lo aprueba o retira.
+    _suscripcionesCuenta.add(db.collection('roles').doc(kUserIdActual).snapshots().listen((doc) {
+      final rol = doc.data()?['rol'];
+      final nuevoRol = (rol == 'apicultor' || rol == 'aplicador') ? rol as String : 'vecino';
       if (!mounted) return;
-      setState(() => _solicitud = datos);
-      final estado = datos?['estado'];
-      final cambiaRol = (estado == 'aprobada' && _rolVerificado == 'vecino') ||
-          (estado == 'retirada' && _rolVerificado != 'vecino');
-      if (!cambiaRol) return;
-      final nuevoRol = await leerRolVerificado(forzar: true);
-      if (!mounted) return;
+      final antes = _rolVerificado;
       setState(() => _rolVerificado = nuevoRol);
-      if (estadoAnterior == 'pendiente' && nuevoRol != 'vecino') {
+      if (!primeraLectura && antes == 'vecino' && nuevoRol != 'vecino') {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
           backgroundColor: const Color(0xFF2E7D32),
           content: Text('Cuenta verificada como ${kNombresRol[nuevoRol]}.'),
         ));
       }
-    }, onError: (_) {});
+      primeraLectura = false;
+    }, onError: (_) {}));
+
+    _suscripcionesCuenta.add(db.collection('admins').doc(kUserIdActual).snapshots().listen((doc) {
+      if (mounted) setState(() => _esAdmin = doc.exists);
+    }, onError: (_) {}));
+
+    _suscripcionesCuenta.add(db.collection('solicitudes').doc(kUserIdActual).snapshots().listen((doc) {
+      if (mounted) setState(() => _solicitud = doc.data());
+    }, onError: (_) {}));
   }
 
   Future<void> _cambiarModoProfesional(bool activo) async {
@@ -619,7 +600,9 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
   @override
   void dispose() {
     _suscripcionPosicion?.cancel();
-    _suscripcionSolicitud?.cancel();
+    for (final s in _suscripcionesCuenta) {
+      s.cancel();
+    }
     _relojRefresco?.cancel();
     ubicacionNotificacionSeleccionada.removeListener(_onNotificacionPulsada);
     _searchController.dispose();
@@ -2253,6 +2236,8 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                                 // Sin verificar: enviar (o consultar) la solicitud.
                                 _mostrarDialogoSolicitud();
                               }
+                            } else if (val == 'panel_admin') {
+                              Navigator.push(context, MaterialPageRoute(builder: (_) => const PanelVerificacionScreen()));
                             } else if (val == 'logout') {
                               // Cerrar Sesión
                               await desregistrarDispositivo();
@@ -2275,6 +2260,17 @@ class _MapaAvisosScreenState extends State<MapaAvisosScreen> {
                                 ],
                               ),
                             ),
+                            if (_esAdmin)
+                              const PopupMenuItem<String>(
+                                value: 'panel_admin',
+                                child: Row(
+                                  children: [
+                                    Icon(Icons.admin_panel_settings_outlined, size: 18, color: Color(0xFF00E676)),
+                                    SizedBox(width: 10),
+                                    Text('Panel de verificación', style: TextStyle(color: Colors.white)),
+                                  ],
+                                ),
+                              ),
                             const PopupMenuItem<String>(
                               value: 'logout',
                               child: Row(
@@ -2672,6 +2668,271 @@ _glassContainer(
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error al generar Excel: $e')));
       }
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Panel de verificación (solo administradores): aprobar o rechazar a
+// apicultores y aplicadores con un botón, sin usar la terminal.
+// ---------------------------------------------------------------------------
+
+class PanelVerificacionScreen extends StatelessWidget {
+  const PanelVerificacionScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final db = FirebaseFirestore.instance;
+    return DefaultTabController(
+      length: 2,
+      child: Scaffold(
+        backgroundColor: const Color(0xFF0B0F14),
+        appBar: AppBar(
+          backgroundColor: const Color(0xFF131A20),
+          foregroundColor: Colors.white,
+          title: const Text('Panel de verificación'),
+          bottom: const TabBar(
+            labelColor: Color(0xFF00E676),
+            unselectedLabelColor: Colors.white54,
+            indicatorColor: Color(0xFF00E676),
+            tabs: [Tab(text: 'Pendientes'), Tab(text: 'Verificados')],
+          ),
+        ),
+        body: TabBarView(
+          children: [
+            StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+              stream: db.collection('solicitudes').where('estado', isEqualTo: 'pendiente').snapshots(),
+              builder: (context, snap) {
+                if (snap.hasError) return _mensaje('No se pudieron cargar las solicitudes.\n${snap.error}');
+                if (!snap.hasData) return const Center(child: CircularProgressIndicator(color: Color(0xFF00E676)));
+                final docs = [...snap.data!.docs]..sort((a, b) {
+                    final fa = a.data()['fecha'], fb = b.data()['fecha'];
+                    return (fa is Timestamp && fb is Timestamp) ? fa.compareTo(fb) : 0;
+                  });
+                if (docs.isEmpty) return _mensaje('No hay solicitudes pendientes. 🎉');
+                return ListView(padding: const EdgeInsets.all(12), children: docs.map((d) => _TarjetaSolicitud(doc: d)).toList());
+              },
+            ),
+            StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+              stream: db.collection('roles').snapshots(),
+              builder: (context, snap) {
+                if (snap.hasError) return _mensaje('No se pudieron cargar los verificados.\n${snap.error}');
+                if (!snap.hasData) return const Center(child: CircularProgressIndicator(color: Color(0xFF00E676)));
+                final docs = snap.data!.docs;
+                if (docs.isEmpty) return _mensaje('Todavía no hay cuentas verificadas.');
+                return ListView(
+                  padding: const EdgeInsets.all(12),
+                  children: docs.map((d) {
+                    final r = d.data();
+                    return Card(
+                      color: const Color(0xFF131A20),
+                      child: ListTile(
+                        leading: Icon(r['rol'] == 'apicultor' ? Icons.hive_outlined : Icons.agriculture_rounded, color: const Color(0xFF00E676)),
+                        title: Text(r['nombre']?.toString() ?? r['email']?.toString() ?? d.id, style: const TextStyle(color: Colors.white)),
+                        subtitle: Text('${kNombresRol[r['rol']] ?? r['rol']} • ${r['numeroOficial'] ?? ''}\n${r['email'] ?? ''}', style: const TextStyle(color: Colors.white60)),
+                        isThreeLine: true,
+                        trailing: TextButton(
+                          onPressed: () => _retirar(context, d.id, r),
+                          child: const Text('Retirar', style: TextStyle(color: Colors.redAccent)),
+                        ),
+                      ),
+                    );
+                  }).toList(),
+                );
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  static Widget _mensaje(String texto) => Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Text(texto, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white60)),
+        ),
+      );
+
+  static Future<void> _retirar(BuildContext context, String uid, Map<String, dynamic> r) async {
+    final motivo = await pedirMotivo(context, 'Retirar verificación a ${r['nombre'] ?? r['email'] ?? ''}');
+    if (motivo == null || !context.mounted) return;
+    final db = FirebaseFirestore.instance;
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await db.collection('roles').doc(uid).delete();
+      await db.collection('solicitudes').doc(uid).update({
+        'estado': 'retirada',
+        'motivo': motivo,
+        'fechaRevision': FieldValue.serverTimestamp(),
+      }).catchError((_) {}); // Puede no existir si se verificó desde la terminal.
+      messenger.showSnackBar(const SnackBar(content: Text('Verificación retirada.')));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('Error: $e'), backgroundColor: Colors.redAccent));
+    }
+  }
+}
+
+/// Pide un motivo (opcional). Devuelve null si se cancela.
+Future<String?> pedirMotivo(BuildContext context, String titulo) {
+  final ctrl = TextEditingController();
+  return showDialog<String>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      backgroundColor: const Color(0xFF131A20),
+      title: Text(titulo, style: const TextStyle(color: Colors.white, fontSize: 17)),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          TextField(
+            controller: ctrl,
+            maxLength: 300,
+            style: const TextStyle(color: Colors.white),
+            decoration: const InputDecoration(labelText: 'Motivo (lo verá el usuario)', labelStyle: TextStyle(color: Colors.white54)),
+          ),
+          Wrap(
+            spacing: 6,
+            children: ['El número no existe', 'Los datos no coinciden', 'Falta el justificante']
+                .map((m) => ActionChip(label: Text(m, style: const TextStyle(fontSize: 12)), onPressed: () => ctrl.text = m))
+                .toList(),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancelar', style: TextStyle(color: Colors.white54))),
+        ElevatedButton(
+          style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+          onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+          child: const Text('Confirmar', style: TextStyle(color: Colors.white)),
+        ),
+      ],
+    ),
+  );
+}
+
+class _TarjetaSolicitud extends StatefulWidget {
+  const _TarjetaSolicitud({required this.doc});
+  final QueryDocumentSnapshot<Map<String, dynamic>> doc;
+
+  @override
+  State<_TarjetaSolicitud> createState() => _TarjetaSolicitudState();
+}
+
+class _TarjetaSolicitudState extends State<_TarjetaSolicitud> {
+  bool _trabajando = false;
+
+  Map<String, dynamic> get _s => widget.doc.data();
+
+  Future<void> _aprobar() async {
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _trabajando = true);
+    final db = FirebaseFirestore.instance;
+    // Las dos escrituras van juntas: o se aprueban las dos o ninguna.
+    final lote = db.batch()
+      ..set(db.collection('roles').doc(widget.doc.id), {
+        'rol': _s['rol'],
+        'nombre': _s['nombre'],
+        'email': _s['email'],
+        'numeroOficial': _s['numeroOficial'],
+        'aprobadoPor': FirebaseAuth.instance.currentUser?.uid,
+        'fecha': FieldValue.serverTimestamp(),
+      })
+      ..update(widget.doc.reference, {
+        'estado': 'aprobada',
+        'motivo': '',
+        'fechaRevision': FieldValue.serverTimestamp(),
+      });
+    try {
+      await lote.commit();
+      messenger.showSnackBar(SnackBar(content: Text('${_s['nombre']} verificado como ${kNombresRol[_s['rol']]}.')));
+    } catch (e) {
+      if (mounted) setState(() => _trabajando = false);
+      messenger.showSnackBar(SnackBar(content: Text('Error: $e'), backgroundColor: Colors.redAccent));
+    }
+  }
+
+  Future<void> _rechazar() async {
+    final motivo = await pedirMotivo(context, 'Rechazar a ${_s['nombre']}');
+    if (motivo == null || !mounted) return;
+    final messenger = ScaffoldMessenger.of(context);
+    setState(() => _trabajando = true);
+    try {
+      await widget.doc.reference.update({
+        'estado': 'rechazada',
+        'motivo': motivo,
+        'fechaRevision': FieldValue.serverTimestamp(),
+      });
+      messenger.showSnackBar(const SnackBar(content: Text('Solicitud rechazada.')));
+    } catch (e) {
+      if (mounted) setState(() => _trabajando = false);
+      messenger.showSnackBar(SnackBar(content: Text('Error: $e'), backgroundColor: Colors.redAccent));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final esApicultor = _s['rol'] == 'apicultor';
+    String dos(int n) => n.toString().padLeft(2, '0');
+    final f = _s['fecha'] is Timestamp ? (_s['fecha'] as Timestamp).toDate() : null;
+    final fecha = f == null ? '' : '${dos(f.day)}/${dos(f.month)}/${f.year} ${dos(f.hour)}:${dos(f.minute)}';
+    final numero = _s['numeroOficial']?.toString() ?? '';
+    return Card(
+      color: const Color(0xFF131A20),
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(children: [
+              Icon(esApicultor ? Icons.hive_outlined : Icons.agriculture_rounded, color: const Color(0xFF00E676)),
+              const SizedBox(width: 8),
+              Expanded(child: Text(_s['nombre']?.toString() ?? '', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16))),
+              Text(kNombresRol[_s['rol']] ?? '', style: const TextStyle(color: Color(0xFF00E676), fontWeight: FontWeight.bold)),
+            ]),
+            const SizedBox(height: 6),
+            Text(_s['email']?.toString() ?? '', style: const TextStyle(color: Colors.white70)),
+            Row(children: [
+              Expanded(child: Text('${esApicultor ? 'REGA' : 'ROPO'}: $numero', style: const TextStyle(color: Colors.white, fontFamily: 'monospace'))),
+              IconButton(
+                tooltip: 'Copiar número',
+                icon: const Icon(Icons.copy_rounded, size: 18, color: Colors.white54),
+                onPressed: () {
+                  Clipboard.setData(ClipboardData(text: numero));
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Número copiado'), duration: Duration(seconds: 1)));
+                },
+              ),
+            ]),
+            Text(
+              esApicultor
+                  ? 'Comprueba el código REGA con el justificante de su explotación.'
+                  : 'Comprueba el nº ROPO en el buscador del Ministerio de Agricultura (ROPO).',
+              style: const TextStyle(color: Colors.white38, fontSize: 12),
+            ),
+            if (fecha.isNotEmpty) Text('Solicitado: $fecha', style: const TextStyle(color: Colors.white38, fontSize: 12)),
+            const SizedBox(height: 10),
+            _trabajando
+                ? const Center(child: CircularProgressIndicator(color: Color(0xFF00E676)))
+                : Row(children: [
+                    Expanded(
+                      child: OutlinedButton(
+                        style: OutlinedButton.styleFrom(foregroundColor: Colors.redAccent, side: const BorderSide(color: Colors.redAccent)),
+                        onPressed: _rechazar,
+                        child: const Text('Rechazar'),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: ElevatedButton(
+                        style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00E676), foregroundColor: Colors.black),
+                        onPressed: _aprobar,
+                        child: const Text('Aprobar', style: TextStyle(fontWeight: FontWeight.bold)),
+                      ),
+                    ),
+                  ]),
+          ],
+        ),
+      ),
+    );
   }
 }
 
