@@ -31,7 +31,7 @@ const esNumero = (v) => typeof v === "number" && Number.isFinite(v);
  * Devuelve un Map uid -> motivo ("cerca de tu posición" / "cerca de tu parcela X")
  * con los usuarios afectados por el aviso.
  */
-async function calcularDestinatarios(db, aviso) {
+async function calcularDestinatarios(db, aviso, { incluirCreador = false } = {}) {
   const lat = aviso.latitud;
   const lng = aviso.longitud;
   const radioKm = esNumero(aviso.radioKm) ? aviso.radioKm : 1.0;
@@ -63,7 +63,12 @@ async function calcularDestinatarios(db, aviso) {
     }
   });
 
-  if (aviso.creatorUid) afectados.delete(aviso.creatorUid);
+  // Normalmente a quien publica no se le avisa. En modo de prueba sí, esté donde
+  // esté, para poder probar las notificaciones con un solo dispositivo.
+  if (aviso.creatorUid) {
+    if (incluirCreador) afectados.set(aviso.creatorUid, "modo de prueba");
+    else afectados.delete(aviso.creatorUid);
+  }
   return afectados;
 }
 
@@ -73,12 +78,12 @@ async function calcularDestinatarios(db, aviso) {
  * de dónde estén instalados los node_modules).
  * Devuelve { usuarios, enviados, fallidos }.
  */
-async function notificarAviso({ db, messaging, FieldValue, avisoId, aviso }) {
+async function notificarAviso({ db, messaging, FieldValue, avisoId, aviso, incluirCreador }) {
   if (!esNumero(aviso.latitud) || !esNumero(aviso.longitud)) {
     return { usuarios: 0, enviados: 0, fallidos: 0 };
   }
 
-  const afectados = await calcularDestinatarios(db, aviso);
+  const afectados = await calcularDestinatarios(db, aviso, { incluirCreador });
   if (afectados.size === 0) return { usuarios: 0, enviados: 0, fallidos: 0 };
 
   const titulo = "⚡ ALERTA FITOSANITARIA";
@@ -118,7 +123,8 @@ async function notificarAviso({ db, messaging, FieldValue, avisoId, aviso }) {
   if (mensajes.length === 0) return { usuarios: afectados.size, enviados: 0, fallidos: 0 };
 
   const { enviados, fallidos } = await enviarMensajes(db, messaging, FieldValue, mensajes, origen);
-  return { usuarios: afectados.size, enviados, fallidos };
+  const destinos = origen.map(([, token]) => `...${token.slice(-8)}`);
+  return { usuarios: afectados.size, enviados, fallidos, destinos };
 }
 
 /**

@@ -10,7 +10,12 @@ initializeApp({ credential: cert(serviceAccount) });
 const db = getFirestore();
 const messaging = getMessaging();
 
+// `node servidor_avisos.js --prueba`: avisa también a quien publica el aviso.
+// Los demás usuarios afectados lo siguen recibiendo igual.
+const modoPrueba = process.argv.includes("--prueba");
+
 console.log("🟢 Servidor activo (filtrado por distancia en el servidor)...");
+if (modoPrueba) console.log("🧪 MODO DE PRUEBA: quien publica un aviso también recibe la notificación.");
 
 db.collection("avisos").onSnapshot((snapshot) => {
   snapshot.docChanges().forEach(async (change) => {
@@ -21,9 +26,17 @@ db.collection("avisos").onSnapshot((snapshot) => {
     // Al arrancar, onSnapshot devuelve todos los avisos antiguos: solo se envían los recientes.
     if ((Date.now() - fechaDoc.getTime()) / 1000 > 60) return;
 
+    // En modo de prueba se espera un poco para dar tiempo a salir de la app y ver
+    // la notificación push del sistema (con la app abierta la muestra la propia app).
+    if (modoPrueba) {
+      console.log("⏳ Sal a la pantalla de inicio del móvil: envío en 15 segundos...");
+      await new Promise((resolve) => setTimeout(resolve, 15000));
+    }
+
     try {
-      const r = await notificarAviso({ db, messaging, FieldValue, avisoId: change.doc.id, aviso: data });
+      const r = await notificarAviso({ db, messaging, FieldValue, avisoId: change.doc.id, aviso: data, incluirCreador: modoPrueba });
       console.log(`📲 Aviso ${change.doc.id}: ${r.usuarios} usuarios afectados, ${r.enviados} enviados, ${r.fallidos} fallidos.`);
+      if (modoPrueba && r.destinos) console.log(`🔎 Enviado a los móviles: ${r.destinos.join(", ")}`);
     } catch (error) {
       console.error("❌ Error al enviar:", error);
     }

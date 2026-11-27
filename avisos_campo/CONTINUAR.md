@@ -1,5 +1,17 @@
 # Por dónde me he quedado (27 de noviembre de 2026)
 
+## Contexto para una conversación nueva
+
+- **Proyecto:** Agribee Alert (`avisos_campo`), Flutter + Firebase (proyecto `avisos-campo`). Debe funcionar en Android e iOS.
+- **Carpeta de trabajo en el PC:** `Escritorio\AgribeeAlert-app\avisos_campo` (clon de GitHub). La antigua `Escritorio\avisos_campo` ya no se usa.
+- **Cómo trabajar conmigo:** háblame en español. El emulador y `flutter run` los lanzo yo.
+- **Nunca subir a GitHub:** `claves.json` ni `serviceAccountKey.json`.
+- **Entorno del PC:** Flutter en `C:\Users\Usuario\flutter` (fuera del PATH para el asistente), Android Studio en `D:\Android\Android Studio`, SDK en `D:\Android\Sdk`, `JAVA_HOME` ya configurado.
+- **Archivos principales:** `lib/main.dart` (app), `functions/notificar.js` (a quién se avisa), `servidor_avisos.js` (servidor local), `firestore.rules` (permisos, ya publicadas), `admin_verificaciones.js` (nombrar administradores).
+- **Pruebas:** `flutter test` y `flutter analyze` (la última vez, solo 2 avisos informativos de obsolescencia).
+- **Inicio de sesión:** el error `blocked` en el PC dejó de salir; la huella SHA-1 va en Google Cloud (Credenciales) y en Firebase.
+- **Modo de prueba:** `node servidor_avisos.js --prueba` notifica también a quien publica el aviso, para probar con un solo dispositivo.
+
 ## Hecho
 
 - Arreglos generales, configuración de iOS y Android, reglas de Firestore y notificaciones filtradas por distancia en el servidor.
@@ -9,9 +21,9 @@
 
 ## Pendiente
 
-1. **Las notificaciones push no están probadas.**
-   - El último aviso que publiqué no se guardó en la base de datos (el más reciente era del 8 de octubre). Falta saber si la app da error al publicar.
-   - A quien publica el aviso **no le llega** notificación. Para probar hacen falta dos dispositivos con cuentas distintas.
+1. ~~Probar las notificaciones push.~~ Probadas el 27/11 en el emulador Android con `--prueba` (espera 15 s para salir de la app).
+   - Si el servidor dice `enviados` pero no llega nada, reiniciar la app y comparar la terminación del móvil (`Dispositivo registrado para avisos`) con la del servidor.
+   - Falta probar con dos dispositivos y cuentas distintas (sin `--prueba`).
 2. Regenerar la clave de Stadia: la antigua sigue en el historial de GitHub.
 3. iOS: sin probar. Hace falta un Mac (o un servicio como Codemagic) y cuenta de desarrollador de Apple.
 

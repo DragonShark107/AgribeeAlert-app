@@ -230,7 +230,13 @@ Future<void> registrarDispositivo(String uid) async {
       }
     }
     final token = await FirebaseMessaging.instance.getToken();
-    if (token != null) await guardarToken(token);
+    if (token != null) {
+      await guardarToken(token);
+      // Solo el final del token, para compararlo con el del servidor en modo de prueba.
+      debugPrint('Dispositivo registrado para avisos: ...${token.substring(token.length - 8)}');
+    } else {
+      debugPrint('No se pudo registrar el dispositivo para avisos: sin token');
+    }
   } catch (e) {
     debugPrint('No se pudo registrar el dispositivo para avisos: $e');
   }
