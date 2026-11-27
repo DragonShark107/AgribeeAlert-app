@@ -2,6 +2,8 @@
 
 App Flutter + Firebase que avisa a apicultores, agricultores y vecinos de los tratamientos fitosanitarios cercanos.
 
+**¿Cambias de ordenador? Lee [CONTINUAR.md](CONTINUAR.md).**
+
 ## Ejecutar la app
 
 1. Copia `claves.example.json` a `claves.json` y pon tu clave de Stadia Maps. `claves.json` no se sube a GitHub.
